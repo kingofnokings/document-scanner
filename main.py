@@ -1,5 +1,7 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
+from queue import Queue, Empty
+from threading import Thread
 
 from ocr import extrair_texto
 
@@ -126,6 +128,7 @@ class ImagePreprocessorApp:
         ("blur", "Gaussian Blur"),
         ("threshold", "Threshold"),
         ("warped", "Documento digitalizado"),
+        ("ocr", "Preparação do OCR"),
     ]
 
     def __init__(self, root):
@@ -137,8 +140,11 @@ class ImagePreprocessorApp:
         self.resultado = None
         self.warped = None
         self.texto_ocr = ""
+        self.avaliacao_ocr = None
         self.fotos = {}
         self.labels = {}
+        self.processando_ocr = False
+        self.fila_ocr = Queue()
 
         #Barra lateral
         barra = tk.Frame(root, padx=20, pady=20)
@@ -146,8 +152,10 @@ class ImagePreprocessorApp:
 
         #Botoes
         #command=self.carregar
-        tk.Button(barra, text="Escolher arquivo", command=self.carregar,
-                  font=("Arial", 11, "bold")).pack(fill="x")
+        self.btn_carregar = tk.Button(
+            barra, text="Escolher arquivo", command=self.carregar,
+            font=("Arial", 11, "bold"))
+        self.btn_carregar.pack(fill="x")
 
         #command=self.processar
         self.btn = tk.Button(barra, text="Processar", command=self.processar,
@@ -177,6 +185,20 @@ class ImagePreprocessorApp:
             state="disabled",
         )
         self.btn_salvar_texto.pack(fill="x")
+        self.status_ocr = tk.StringVar(value="Escolha e processe uma imagem.")
+        tk.Label(barra, textvariable=self.status_ocr, wraplength=190,
+                 justify="left").pack(fill="x", pady=(15, 6))
+        self.progresso_ocr = ttk.Progressbar(barra, mode="indeterminate")
+        self.progresso_ocr.pack(fill="x")
+
+        quadro_avaliacao = tk.LabelFrame(barra, text="Avaliação do OCR", padx=8, pady=8)
+        quadro_avaliacao.pack(fill="x", pady=15)
+        self.resumo_ocr = tk.StringVar(value="Extraia o texto para ver a avaliação.")
+        tk.Label(quadro_avaliacao, textvariable=self.resumo_ocr, wraplength=190,
+                 justify="left", anchor="w").pack(fill="x")
+        tk.Label(quadro_avaliacao,
+                 text="Estimativa automática; não representa acertos confirmados.",
+                 wraplength=190, justify="left", fg="#555555").pack(fill="x", pady=(8, 0))
 
         #Área principal
         grade = tk.Frame(root, padx=10, pady=10)
@@ -198,6 +220,8 @@ class ImagePreprocessorApp:
             grade.grid_rowconfigure(r, weight=1)
 
     def carregar(self):
+        if self.processando_ocr:
+            return
 
       #Askopenfilename
       #askopenfilename abre a janela nativa do sistema para escolher um arquivo
@@ -219,17 +243,25 @@ class ImagePreprocessorApp:
         self.resultado = None
         self.warped = None
         self.texto_ocr = ""
+        self.avaliacao_ocr = None
+        self.resumo_ocr.set("Extraia o texto para ver a avaliação.")
         self.btn_salvar_texto.config(state="disabled")
         self.btn.config(state="normal")
         self.mostrar("original", imagem)
+        self.status_ocr.set("Imagem carregada. Clique em Processar.")
 
         for chave, _ in self.ETAPAS[1:]:
             self.labels[chave].config(image="", text="Aguardando")
 
     def processar(self):
-        if self.imagem is None:
+        if self.imagem is None or self.processando_ocr:
             return
 
+        self.texto_ocr = ""
+        self.avaliacao_ocr = None
+        self.resumo_ocr.set("Extraia o texto para ver a avaliação.")
+        self.btn_salvar_texto.config(state="disabled")
+        self.labels["ocr"].config(image="", text="Aguardando OCR")
         #preprocessamento() devolve as três imagens 
         gray, blur, threshold = preprocessamento(self.imagem)
 
@@ -252,27 +284,84 @@ class ImagePreprocessorApp:
 
         #Define a escala de cinza como arquivo que sera salvo
         self.resultado = gray
+        self.status_ocr.set("Documento pronto. Clique em Extrair texto.")
         self.texto_ocr = ""
+        self.avaliacao_ocr = None
+        self.resumo_ocr.set("Extraia o texto para ver a avaliação.")
         self.btn_salvar_texto.config(state="disabled")
 
     def executar_ocr(self):
+        if self.processando_ocr:
+            return
         if self.warped is None:
-            messagebox.showwarning(
-                "Aviso", "Processe a imagem antes de extrair o texto."
-            )
+            messagebox.showwarning("Aviso", "Processe a imagem antes de extrair o texto.")
             return
-
-        self.texto_ocr = ""
-        self.btn_salvar_texto.config(state="disabled")
-        texto = extrair_texto(self.warped)
-
-        if not texto:
-            messagebox.showinfo("OCR", "Nenhum texto foi encontrado.")
+        # Reutiliza a leitura enquanto a imagem não for trocada ou reprocessada.
+        if self.texto_ocr.strip():
+            messagebox.showinfo("Texto extraído", self.texto_ocr)
             return
+        self.processando_ocr = True
+        for botao in (self.btn_carregar, self.btn, self.btn_ocr, self.btn_salvar_texto):
+            botao.config(state="disabled")
+        self.status_ocr.set("Iniciando OCR…")
+        self.avaliacao_ocr = None
+        self.resumo_ocr.set("Calculando a avaliação…")
+        self.progresso_ocr.start(12)
+        imagem = self.warped.copy()
 
-        self.texto_ocr = texto
-        self.btn_salvar_texto.config(state="normal")
-        messagebox.showinfo("Texto extraído", texto)
+        # O trabalho pesado não acessa widgets; envia mensagens para a interface.
+        def trabalho():
+            try:
+                resultado = extrair_texto(
+                    imagem, progresso=lambda etapa, img: self.fila_ocr.put(("etapa", etapa, img)),
+                    retornar_detalhes=True,
+                )
+                self.fila_ocr.put(("resultado", resultado, None))
+            except Exception as erro:
+                self.fila_ocr.put(("erro", str(erro), None))
+
+        Thread(target=trabalho, daemon=True).start()
+        self.root.after(80, self._acompanhar_ocr)
+
+    def _acompanhar_ocr(self):
+        # Apenas a thread principal modifica a janela do Tkinter.
+        try:
+            while True:
+                tipo, mensagem, imagem = self.fila_ocr.get_nowait()
+                if tipo == "etapa":
+                    self.status_ocr.set(mensagem)
+                    if imagem is not None:
+                        self.mostrar("ocr", imagem)
+                    continue
+                self.processando_ocr = False
+                self.progresso_ocr.stop()
+                for botao in (self.btn_carregar, self.btn, self.btn_ocr):
+                    botao.config(state="normal")
+                if tipo == "erro":
+                    self.status_ocr.set("Falha no OCR. Confira a mensagem.")
+                    self.resumo_ocr.set("Avaliação indisponível.")
+                    messagebox.showerror("Erro no OCR", mensagem)
+                    return
+                self.texto_ocr = mensagem["texto"]
+                self._mostrar_avaliacao(mensagem)
+                if not self.texto_ocr.strip():
+                    messagebox.showinfo("OCR", "Nenhum texto foi encontrado.")
+                    return
+                self.btn_salvar_texto.config(state="normal")
+                messagebox.showinfo("Texto extraído", self.texto_ocr)
+                return
+        except Empty:
+            if self.processando_ocr:
+                self.root.after(80, self._acompanhar_ocr)
+
+    def _mostrar_avaliacao(self, resultado):
+        self.avaliacao_ocr = resultado
+        confianca = f"{resultado['confianca_media']:.1f}".replace(".", ",")
+        self.resumo_ocr.set(
+            f"Letras e números extraídos: {resultado['caracteres_total']}\n\n"
+            f"Em palavras com confiança ≥ 40: {resultado['caracteres_confiaveis']}\n\n"
+            f"Confiança média das palavras: {confianca} / 100"
+        )
 
     def salvar_texto(self):
         if not self.texto_ocr.strip():
