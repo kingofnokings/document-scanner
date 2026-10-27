@@ -30,11 +30,13 @@ def order_points(pts):
 
 
 def four_point_transform(image, points):
+    # rect recebe os quatro cantos ordenados
     rect = order_points(points)
 
+    # Desempacotamento dos quatro cantos do retângulo
     top_left, top_right, bottom_right, bottom_left = rect
 
-    # Calcular as dimensões aproximadas do documento.
+    # Cálculo das dimensões aproximadas do documento.
     width_a = np.linalg.norm(bottom_right - bottom_left)
     width_b = np.linalg.norm(top_right - top_left)
 
@@ -58,7 +60,7 @@ def four_point_transform(image, points):
         dtype="float32"
     )
 
-    # Calcular a matriz de transformação de perspectiva.
+    # Calcular a matriz de transformação projetiva.
     matrix = cv2.getPerspectiveTransform(rect, destination)
 
     # Aplicar a transformação à imagem original colorida.
@@ -77,27 +79,36 @@ def scan_detection(image):
     # Obtém dinamicamente a largura e altura da imagem original
     HEIGHT, WIDTH = image.shape[:2]
 
+    # Inicializa a variável com os cantos da imagem inteira
     document_contour = np.array([[0, 0], [WIDTH, 0], [WIDTH, HEIGHT], [0, HEIGHT]])
 
+    # Pré-processamento
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     _, threshold_img = cv2.threshold(
         blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
+
+    # Encontra todos os contornos da imagem processada
     contours, _ = cv2.findContours(
         threshold_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
+
+    # Ordena do maior para o menor
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     max_area = 0
-    max_contour = None
 
     for contour in contours:
+        # Calcula a área do contorno (em pixels quadrados)
         area = cv2.contourArea(contour)
+        # São considerados apenas contornos acima de 1000 pixels
         if area > 1000:
             perimeter = cv2.arcLength(contour, True)
+            # Simplifica o contorno transformando em uma forma geométrica
             approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
             if area > max_area and len(approx) == 4:
+                # document_contour recebe os quatro pontos do maior quadrilátero
                 document_contour = approx
                 max_area = area
 
@@ -270,7 +281,9 @@ class ImagePreprocessorApp:
             self.mostrar(chave, img)
 
         global document_contour
+        # Detecção dos contornos em cima da imagem original
         scan_detection(self.imagem)
+        # Aplicação da transformação de perspectiva
         self.warped = four_point_transform(
             self.imagem, document_contour.reshape(4, 2)
             )
