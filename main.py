@@ -26,6 +26,10 @@ AREA_MINIMA_RELATIVA = 0.15
 # Pelo menos metade do contorno precisa estar sobre bordas reais da imagem.
 APOIO_MINIMO = 0.5
 
+# Cada lado do contorno (fora da margem da foto) precisa ter pelo menos esta
+# fração apoiada em bordas reais. Evita aceitar um lado "inventado".
+LADO_MINIMO = 0.2
+
 
 def order_points(pts):
     # Inicializa uma lista de coordenadas que serão ordenadas
@@ -226,23 +230,46 @@ def _encaixar_nas_retas(cantos, segmentos, altura, largura):
 
 
 def _apoio_nas_bordas(cantos, bordas):
-    """Fração do contorno do quadrilátero que passa sobre bordas reais (0 a 1).
+    """Apoio do contorno nas bordas reais: (média, pior lado) entre 0 e 1.
 
-    Um quadrilátero certo tem os 4 lados em cima da borda da folha. Um
-    errado corta o meio do papel ou do fundo, onde não há borda.
+    Um quadrilátero certo tem os 4 lados em cima da borda da folha. Um errado
+    corta o meio do papel ou do fundo, onde não há borda. Antes só a MÉDIA era
+    avaliada, e um lado inventado (uma diagonal, por exemplo) passava se os
+    outros três fossem fortes; agora o PIOR lado também precisa ter apoio.
     Trechos colados na margem da foto não contam (não dá para saber).
     """
-    linha = np.zeros(bordas.shape, np.uint8)
-    cv2.polylines(linha, [cantos.astype(np.int32)], True, 255, 1)
     m = 4
-    linha[:m, :] = 0
-    linha[-m:, :] = 0
-    linha[:, :m] = 0
-    linha[:, -m:] = 0
-    total = cv2.countNonZero(linha)
-    if total < 0.25 * cv2.arcLength(cantos.reshape(-1, 1, 2), True):
-        return 0.0  # quase todo na margem: provavelmente é a própria foto
-    return cv2.countNonZero(cv2.bitwise_and(linha, bordas)) / total
+    suportes, acertos, totais = [], 0, 0
+    for k in range(4):
+        linha = np.zeros(bordas.shape, np.uint8)
+        cv2.line(linha, tuple(int(v) for v in cantos[k]),
+                 tuple(int(v) for v in cantos[(k + 1) % 4]), 255, 1)
+        linha[:m, :] = 0
+        linha[-m:, :] = 0
+        linha[:, :m] = 0
+        linha[:, -m:] = 0
+        total = cv2.countNonZero(linha)
+        comprimento = float(np.linalg.norm(cantos[(k + 1) % 4] - cantos[k]))
+        if total < 0.25 * comprimento:
+            continue  # lado quase todo na margem: não dá para medir
+        sobre_borda = cv2.countNonZero(cv2.bitwise_and(linha, bordas))
+        suportes.append(sobre_borda / total)
+        acertos += sobre_borda
+        totais += total
+    if not suportes:
+        return 0.0, 0.0
+    # Média ponderada pelo comprimento (como na versão original) e o pior lado.
+    return acertos / totais, float(min(suportes))
+
+
+def _lado_na_margem(cantos, h, w, m=4):
+    """True se algum lado do quadrilátero está colado numa borda da foto."""
+    for k in range(4):
+        p, q = cantos[k], cantos[(k + 1) % 4]
+        if ((p[0] <= m and q[0] <= m) or (p[0] >= w - 1 - m and q[0] >= w - 1 - m)
+                or (p[1] <= m and q[1] <= m) or (p[1] >= h - 1 - m and q[1] >= h - 1 - m)):
+            return True
+    return False
 
 
 def _melhor_candidato(mascaras, bordas_finas, bordas_nota, h, w, apoio_minimo=None):
@@ -273,21 +300,270 @@ def _melhor_candidato(mascaras, bordas_finas, bordas_nota, h, w, apoio_minimo=No
             fracao_area = cv2.contourArea(cantos) / area_foto
             if not AREA_MINIMA_RELATIVA <= fracao_area <= 0.98:
                 continue
-            apoio = _apoio_nas_bordas(cantos, referencia)
+            apoio, pior_lado = _apoio_nas_bordas(cantos, referencia)
             nota = apoio * fracao_area ** 0.5
-            if apoio >= apoio_minimo and nota > melhor_nota:
+            if apoio >= apoio_minimo and pior_lado >= LADO_MINIMO and nota > melhor_nota:
                 melhor_nota, melhores_cantos = nota, cantos
     return melhores_cantos
 
 
-def scan_detection(image):
+
+
+# ---------------------------------------------------------------------------
+# Passada extra para folha e fundo de cores parecidas (baixo contraste)
+# ---------------------------------------------------------------------------
+
+def _croma(image):
+    """Distância da cor ao cinza neutro, no espaço Lab (0 = cinza puro).
+
+    Papel é neutro (a ≈ b ≈ 128); parede, madeira e tecido quase sempre têm
+    algum tom. Assim a folha se separa do fundo mesmo quando o BRILHO é igual.
+    """
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    return np.hypot(lab[:, :, 1] - 128, lab[:, :, 2] - 128)
+
+
+def _mascara_texto(cinza):
+    """Marca onde há texto: letras escuras e finas, em linhas, sobre fundo claro.
+
+    Blackhat = (fechamento da imagem) - (imagem): só sobram detalhes escuros mais
+    finos que o elemento estruturante, ou seja, letras. Depois juntamos as letras
+    em linhas e blocos e ficamos só com o maior bloco, para ignorar manchas e
+    objetos escuros fora da folha. Linhas finas demais (sombra da borda) são
+    descartadas pela altura mínima.
+    """
+    elem = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    bh = cv2.morphologyEx(cv2.GaussianBlur(cinza, (0, 0), 0.7), cv2.MORPH_BLACKHAT, elem)
+    alto = float(np.percentile(bh, 99.5))
+    mascara = (bh > max(6.0, 0.35 * alto)).astype(np.uint8) * 255
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE,
+                               cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5)))
+    n, rotulos, est, _ = cv2.connectedComponentsWithStats(mascara)
+    limpa = np.zeros_like(mascara)
+    for i in range(1, n):
+        if (est[i, cv2.CC_STAT_AREA] >= 120 and est[i, cv2.CC_STAT_HEIGHT] >= 5
+                and est[i, cv2.CC_STAT_WIDTH] >= 5):
+            limpa[rotulos == i] = 255
+    # Fica só com o maior bloco de texto (blocos próximos contam como um só).
+    perto = cv2.dilate(limpa, np.ones((25, 25), np.uint8))
+    n, rotulos, est, _ = cv2.connectedComponentsWithStats(perto)
+    if n <= 1:
+        return np.zeros_like(limpa)
+    pesos = [cv2.countNonZero(limpa[rotulos == i]) for i in range(1, n)]
+    maior = 1 + int(np.argmax(pesos))
+    return cv2.bitwise_and(limpa, (rotulos == maior).astype(np.uint8) * 255)
+
+
+def _segmentos(canal, comprimento_minimo):
+    """Segmentos de reta do LSD (Line Segment Detector) com sensibilidade alta.
+
+    O LSD não depende de um limiar de borda: ele agrupa pixels cujo gradiente
+    aponta na mesma direção. Por isso acha lados MUITO fracos, desde que
+    sejam retos. quant=0.5 deixa a detecção mais sensível que o padrão (2.0).
+    """
+    lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD, 0.8, 0.6, 0.5, 22.5, 0, 0.7, 1024)
+    seg = lsd.detect(cv2.GaussianBlur(canal, (0, 0), 0.8))[0]
+    if seg is None:
+        return []
+    seg = seg.reshape(-1, 4)
+    comp = np.hypot(seg[:, 2] - seg[:, 0], seg[:, 3] - seg[:, 1])
+    return [tuple(s) for s, c in zip(seg, comp) if c >= comprimento_minimo]
+
+
+def _agrupar_retas(segmentos, h, w, maximo=30):
+    """Une segmentos quase colineares em retas (rho, theta) com o comprimento somado.
+
+    Retorna as retas mais "pesadas" (comprimento total maior) primeiro.
+    """
+    grupos = []  # cada grupo: [rho_medio, theta_medio, comprimento_total]
+    for x1, y1, x2, y2 in segmentos:
+        comp = np.hypot(x2 - x1, y2 - y1)
+        theta = (np.arctan2(y2 - y1, x2 - x1) + np.pi / 2) % np.pi  # normal da reta, 0..pi
+        rho = x1 * np.cos(theta) + y1 * np.sin(theta)
+        for g in grupos:
+            dt = abs((theta - g[1] + np.pi / 2) % np.pi - np.pi / 2)
+            if dt < np.radians(3) and abs(rho - g[0]) < 0.02 * max(h, w):
+                total = g[2] + comp
+                g[0] = (g[0] * g[2] + rho * comp) / total
+                g[1] = g[1] + ((theta - g[1] + np.pi / 2) % np.pi - np.pi / 2) * comp / total
+                g[2] = total
+                break
+        else:
+            grupos.append([rho, theta, comp])
+    grupos.sort(key=lambda g: -g[2])
+    return [(float(r), float(t)) for r, t, c in grupos[:maximo] if c >= 0.2 * min(h, w)]
+
+
+def _intersecao_polar(r1, r2):
+    """Ponto onde duas retas (rho, theta) se cruzam (regra de Cramer), ou None."""
+    (rho1, t1), (rho2, t2) = r1, r2
+    c1, s1, c2, s2 = np.cos(t1), np.sin(t1), np.cos(t2), np.sin(t2)
+    det = c1 * s2 - s1 * c2
+    if abs(det) < 0.2:  # quase paralelas
+        return None
+    return np.array([(rho1 * s2 - s1 * rho2) / det, (c1 * rho2 - rho1 * c2) / det], np.float32)
+
+
+def _suporte_do_lado(p, q, dist, h, w, passo=2.0, tol=3.0):
+    """Fração do lado p→q coberta por segmentos detectados (dist = distância até eles).
+
+    Trechos fora da foto (a folha continua além da margem) são ignorados.
+    """
+    n = max(int(np.linalg.norm(q - p) / passo), 2)
+    pts = p[None, :] + (q - p)[None, :] * np.linspace(0, 1, n)[:, None]
+    dentro = (pts[:, 0] >= 3) & (pts[:, 0] <= w - 4) & (pts[:, 1] >= 3) & (pts[:, 1] <= h - 4)
+    if dentro.sum() < 0.25 * n:
+        return None  # lado quase todo fora da foto: sem como avaliar
+    xs = pts[dentro, 0].astype(int)
+    ys = pts[dentro, 1].astype(int)
+    return float((dist[ys, xs] <= tol).mean())
+
+
+def _contem_texto(cantos, pontos, fracao_minima=0.97):
+    """True se (quase) todos os pontos de texto estão dentro do quadrilátero convexo.
+
+    Um ponto está dentro se fica do mesmo lado dos 4 lados (produto vetorial).
+    """
+    sinais = []
+    for k in range(4):
+        p, q = cantos[k], cantos[(k + 1) % 4]
+        lado = q - p
+        cruz = lado[0] * (pontos[:, 1] - p[1]) - lado[1] * (pontos[:, 0] - p[0])
+        sinais.append(cruz / max(float(np.hypot(*lado)), 1e-6))  # distância com sinal
+    sinais = np.stack(sinais)
+    dentro = (sinais >= -2).all(axis=0) | (sinais <= 2).all(axis=0)
+    return float(dentro.mean()) >= fracao_minima
+
+
+def _quadrilatero_por_retas(retas, raster, h, w, texto=None, apoio_minimo=0.5,
+                            exigir_quatro_lados=False):
+    """Melhor retângulo formado por 2 retas "horizontais" e 2 "verticais".
+
+    As retas atravessam as falhas da borda (trechos em que folha e fundo são
+    quase iguais). Cada candidato recebe nota = apoio × raiz da área, e TODOS
+    os lados medidos precisam de apoio mínimo, para não aceitar um lado inventado.
+    Se houver texto (pontos Nx2), a folha precisa CONTER o texto: um lado que
+    atravessa as letras não pode ser a borda do papel.
+    """
+    if len(retas) < 4:
+        return None
+    dist = cv2.distanceTransform(255 - raster, cv2.DIST_L2, 3)
+    area_foto = h * w
+    thetas = [t for _, t in retas]
+    melhor_nota, melhores, vistos = 0.0, None, set()
+    cache_pontos, cache_lados = {}, {}
+
+    def ponto(i, j):  # cruzamento da reta i com a reta j (calculado uma vez só)
+        chave = (min(i, j), max(i, j))
+        if chave not in cache_pontos:
+            cache_pontos[chave] = _intersecao_polar(retas[i], retas[j])
+        return cache_pontos[chave]
+
+    def lado(i, j1, j2):  # apoio do trecho da reta i entre os cruzamentos com j1 e j2
+        chave = (i, min(j1, j2), max(j1, j2))
+        if chave not in cache_lados:
+            p, q = ponto(i, j1), ponto(i, j2)
+            cache_lados[chave] = (None if p is None or q is None
+                                  else _suporte_do_lado(p, q, dist, h, w))
+        return cache_lados[chave]
+
+    for ancora in range(min(len(retas), 8)):
+        fam_a, fam_b = [], []
+        for i, th in enumerate(thetas):
+            d = abs((th - thetas[ancora] + np.pi / 2) % np.pi - np.pi / 2)
+            d90 = abs((th - thetas[ancora]) % np.pi - np.pi / 2)
+            if d < np.radians(25):
+                fam_a.append(i)
+            elif d90 < np.radians(25):
+                fam_b.append(i)
+        chave = (tuple(fam_a), tuple(fam_b))
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        folga = 0.03 * max(h, w)
+        separacao = 0.2 * min(h, w)  # lados opostos precisam estar bem afastados
+        for i1 in range(len(fam_a)):
+            for i2 in range(i1 + 1, len(fam_a)):
+                ia1, ia2 = fam_a[i1], fam_a[i2]
+                if abs(retas[ia1][0] - retas[ia2][0]) < separacao:
+                    continue
+                for j1 in range(len(fam_b)):
+                    for j2 in range(j1 + 1, len(fam_b)):
+                        ib1, ib2 = fam_b[j1], fam_b[j2]
+                        if abs(retas[ib1][0] - retas[ib2][0]) < separacao:
+                            continue
+                        cantos = [ponto(ia1, ib1), ponto(ia1, ib2), ponto(ia2, ib2), ponto(ia2, ib1)]
+                        if any(c is None for c in cantos):
+                            continue
+                        cantos = np.array(cantos, np.float32)
+                        if ((cantos[:, 0] < -folga) | (cantos[:, 0] > w + folga)
+                                | (cantos[:, 1] < -folga) | (cantos[:, 1] > h + folga)).any():
+                            continue
+                        if not cv2.isContourConvex(cantos.reshape(-1, 1, 2)):
+                            continue
+                        fracao = cv2.contourArea(cantos) / area_foto
+                        if not AREA_MINIMA_RELATIVA <= fracao <= 0.98:
+                            continue
+                        suportes = [lado(ia1, ib1, ib2), lado(ib2, ia1, ia2),
+                                    lado(ia2, ib1, ib2), lado(ib1, ia1, ia2)]
+                        validos = [s for s in suportes if s is not None]
+                        if len(validos) < (4 if exigir_quatro_lados else 3) or min(validos) < 0.15:
+                            continue
+                        apoio = float(np.mean(validos))
+                        nota = apoio * fracao ** 0.5
+                        if apoio < apoio_minimo or nota <= melhor_nota:
+                            continue
+                        if texto is not None and not _contem_texto(cantos, texto):
+                            continue
+                        melhor_nota, melhores = nota, cantos
+    if melhores is None:
+        return None
+    melhores[:, 0] = melhores[:, 0].clip(0, w - 1)
+    melhores[:, 1] = melhores[:, 1].clip(0, h - 1)
+    return melhores
+
+
+def _passada_baixo_contraste(pequena, exigir_quatro_lados=False):
+    """Última tentativa: segmentos LSD em brilho e croma + busca do quadrilátero por retas."""
+    h, w = pequena.shape[:2]
+    minimo = 0.08 * min(h, w)
+    cinza = cv2.cvtColor(pequena, cv2.COLOR_BGR2GRAY)
+    croma = np.clip(_croma(pequena) * 10, 0, 255).astype(np.uint8)  # realça tons fracos
+    segmentos = _segmentos(cinza, minimo) + _segmentos(croma, minimo)
+
+    # O texto gera segmentos fortes (linhas de letras) que NÃO são borda de folha.
+    # Em vez de apagá-los, exigimos que a folha CONTENHA o texto: um lado que
+    # corta as letras é rejeitado em _quadrilatero_por_retas.
+    texto = _mascara_texto(cinza)
+    pontos = None
+    if cv2.countNonZero(texto) >= 400:
+        ys, xs = np.nonzero(texto)
+        passo = max(1, len(xs) // 300)  # amostra ~300 pontos, o bastante e rápido
+        pontos = np.stack([xs[::passo], ys[::passo]], axis=1)
+    if not segmentos:
+        return None
+
+    raster = np.zeros((h, w), np.uint8)
+    for x1, y1, x2, y2 in segmentos:
+        cv2.line(raster, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), 255, 1)
+    retas = _agrupar_retas(segmentos, h, w)
+    return _quadrilatero_por_retas(retas, raster, h, w, texto=pontos,
+                                   exigir_quatro_lados=exigir_quatro_lados)
+
+
+def scan_detection(image, baixo_contraste=True):
     """Encontra os quatro cantos do documento na imagem.
 
     1. Reduz a foto e apaga o texto (só sobram as bordas grandes).
     2. Gera candidatos com Otsu e Canny em dois canais (cinza e brancura).
     3. Ajusta os lados de cada candidato às retas reais (Hough).
     4. Dá uma nota: quanto do contorno está sobre bordas reais e o tamanho.
+       Nenhum lado medido pode ficar sem borda (LADO_MINIMO).
     5. Se nada servir, tenta de novo com CLAHE (bordas fracas, fundo branco).
+    6. Folha e fundo parecidos: se ainda não achou (ou se o resultado encosta
+       na margem da foto), procura retas fracas com LSD em brilho + croma e
+       exige que a folha contenha o texto (_passada_baixo_contraste).
+    baixo_contraste=False pula o passo 6; é o modo rápido da câmera ao vivo.
     Retorna (cantos, encontrou). Se nada for confiável, devolve os cantos da
     imagem inteira e encontrou = False.
     """
@@ -320,6 +596,16 @@ def scan_detection(image):
         ]
         # Exige mais apoio nas bordas: é melhor não achar do que achar errado.
         cantos = _melhor_candidato(mascaras_contraste, bordas, bordas, h, w, apoio_minimo=0.75)
+
+    # Última tentativa para folha e fundo parecidos. Também serve de "segunda
+    # opinião": se o resultado das passadas anteriores tem um lado colado na
+    # margem da foto, a borda daquele lado pode simplesmente não ter sido vista
+    # (folha clara em fundo claro). Se a passada de baixo contraste enxerga os
+    # 4 lados de um quadrilátero menor, ele é o mais confiável.
+    if baixo_contraste and (cantos is None or _lado_na_margem(cantos, h, w)):
+        alternativa = _passada_baixo_contraste(pequena, exigir_quatro_lados=cantos is not None)
+        if alternativa is not None:
+            cantos = alternativa
 
     if cantos is None:
         return cantos_imagem, False
@@ -735,7 +1021,7 @@ class ImagePreprocessorApp:
 
         self.camera_frame = frame.copy()
         try:
-            cantos, encontrou = scan_detection(frame)
+            cantos, encontrou = scan_detection(frame, baixo_contraste=False)  # modo rápido
             previa = four_point_transform(frame, cantos) if encontrou else None
         except Exception as erro:
             self.parar_camera()
@@ -762,12 +1048,14 @@ class ImagePreprocessorApp:
             return
 
         frame = self.camera_frame.copy()
-        cantos = self.camera_cantos.copy() if self.camera_cantos is not None else None
         self.parar_camera(atualizar_status=False)
 
         self.imagem = frame
         self.nome_arquivo = time.strftime("captura_%Y%m%d_%H%M%S.jpg")
-        self._iniciar_processamento(cantos)
+        # A prévia ao vivo usa só as passadas rápidas. No quadro congelado a
+        # detecção completa roda (inclusive a de baixo contraste); se ainda assim
+        # falhar, dá para marcar a folha com Ajustar cantos.
+        self._iniciar_processamento(None)
 
     def parar_camera(self, atualizar_status=True):
         if self.camera_after_id is not None:
