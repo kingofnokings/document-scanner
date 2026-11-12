@@ -2,7 +2,6 @@ import os
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from tkinter import font as tkfont
 from queue import Queue, Empty
 from threading import Thread
 
@@ -26,15 +25,6 @@ AREA_MINIMA_RELATIVA = 0.15
 
 # Pelo menos metade do contorno precisa estar sobre bordas reais da imagem.
 APOIO_MINIMO = 0.5
-
-# Paleta da interface
-COR_FUNDO = "#f4f5f7"
-COR_PAINEL = "#ffffff"
-COR_DESTAQUE = "#215041"
-COR_DESTAQUE_ATIVO = "#2c6b56"
-COR_TEXTO = "#1f2933"
-COR_SECUNDARIA = "#6b7280"
-COR_BORDA = "#d9dde3"
 
 
 def order_points(pts):
@@ -376,265 +366,333 @@ def efeito_scanner(imagem, lado=2200):
     return (tons ** 1.3 * 255).astype(np.uint8)
 
 
+def preprocessamento(imagem):
+    """Etapas do pré-processamento: escala de cinza, blur gaussiano e threshold (Otsu)."""
+    cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+    desfocada = cv2.GaussianBlur(cinza, (5, 5), 0)
+    _, binaria = cv2.threshold(desfocada, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return cinza, desfocada, binaria
+
+
 class ImagePreprocessorApp:
+    # Cores da interface
+    COR_FUNDO = "#F3F6F5"
+    COR_BARRA = "#E9EFED"
+    COR_CARTAO = "#FFFFFF"
+    COR_BORDA = "#D5DEDC"
+    COR_PRIMARIA = "#1FC6A0"
+    COR_SECUNDARIA = "#17363F"
+    COR_TEXTO = "#0F2A33"
+    COR_SUAVE = "#5C6B69"
+    COR_DESATIVADA = "#DDE5E3"
+    COR_TEXTO_DESATIVADO = "#8A9896"
+
+    # Abas: (chave, rótulo, cartões na ordem, mostrar texto?, mostrar botões de salvar?)
+    MODOS = [
+        ("pre", "Original + pré-processamento",
+         ("original", "gray", "blur", "threshold", "warped"), False, False),
+        ("digitalizada", "Original + digitalizada",
+         ("original", "warped", "pb"), True, True),
+        ("todos", "Todos os processos",
+         ("original", "contorno", "gray", "blur", "threshold", "warped", "pb"), True, True),
+    ]
+
+    # Títulos dos cartões de imagem
+    TITULOS = {
+        "original": "ENTRADA",
+        "contorno": "DETECÇÃO",
+        "gray": "ESCALA DE CINZA",
+        "blur": "GAUSSIAN BLUR",
+        "threshold": "THRESHOLD",
+        "warped": "DIGITALIZADA (COR)",
+        "pb": "SCANNER P&B",
+    }
+
+    CARTOES_PROCESSO = ("contorno", "gray", "blur", "threshold", "warped", "pb")
+
     def __init__(self, root):
         self.root = root
         self.root.title("Scanner de Documentos")
-        self.root.geometry("1280x800")
-        self.root.minsize(900, 600)
-        self.root.configure(bg=COR_FUNDO)
+        self.root.geometry("1280x820")
+        self.root.minsize(1000, 700)
+        self.root.configure(bg=self.COR_FUNDO)
+        self.root.protocol("WM_DELETE_WINDOW", self.fechar)
+
+        # Tema da barra de progresso (ttk) com as cores do app
+        estilo = ttk.Style(self.root)
+        estilo.theme_use("clam")
+        estilo.configure("Horizontal.TProgressbar", background=self.COR_PRIMARIA,
+                         troughcolor=self.COR_CARTAO, bordercolor=self.COR_CARTAO,
+                         lightcolor=self.COR_PRIMARIA, darkcolor=self.COR_PRIMARIA)
 
         self.imagem = None
         self.nome_arquivo = ""
         self.cantos = None
+        self.documento_encontrado = False
         self.warped = None
         self.scan_pb = None
-        self.texto_ocr = ""
-        self.modo_saida = tk.StringVar(value="pb")  # "pb" (escaneado) ou "cor"
-        self.cabecalhos = {}
-        self.imagens = {}   # arrays originais de cada visor (para redimensionar)
-        self.fotos = {}     # PhotoImage precisa ficar guardado, senão some
-        self.visores = {}
-        self.processando_ocr = False
-        self.fila_ocr = Queue()
+        self.texto_ocr = ""      # resultado original do OCR (usado nas mensagens)
+        self.originais = {}      # imagens PIL em tamanho real (para redimensionar)
+        self.fotos = {}          # PhotoImage atual de cada cartão (precisa ficar referenciada)
+        self.labels = {}
+        self.areas = {}
+        self.cartoes = {}
+        self.botoes_modo = {}
+        self.cores = {}          # cor original de cada botão (para reativar)
+        self.agendados = {}
+        self.processando = False
+        self.fila = Queue()
         self.inicio_ocr = 0.0
-        self._redimensionar_id = None
+        self.modo = "pre"
 
-        # Estado da câmera ao vivo. A captura e a atualização da interface
-        # são feitas pelo agendador do Tkinter (root.after).
+        # Estado da câmera ao vivo
         self.camera = None
         self.camera_after_id = None
         self.camera_frame = None
         self.camera_cantos = None
 
-        self._configurar_estilo()
-        self._montar_cabecalho()
-        self._montar_rodape()
-        self._montar_conteudo()
-        self._atualizar_botoes()
-        self.root.protocol("WM_DELETE_WINDOW", self.fechar)
+        self._montar_barra_lateral()
+        self._montar_area_principal()
+        self._selecionar_modo(self.modo)
+        self._definir_estado_botoes()
 
-    # ------------------------------------------------------------------ layout
-    def _configurar_estilo(self):
-        familia = tkfont.nametofont("TkDefaultFont").actual("family")
-        tkfont.nametofont("TkDefaultFont").configure(size=10)
-        self.fonte_titulo = (familia, 14, "bold")
-        self.fonte_rotulo = (familia, 9, "bold")
+    # layout
+    def _montar_barra_lateral(self):
+        barra = tk.Frame(self.root, bg=self.COR_BARRA, padx=20, pady=24, width=260)
+        barra.pack(side="left", fill="y")
+        barra.pack_propagate(False)
 
-        estilo = ttk.Style(self.root)
-        estilo.theme_use("clam")
-        estilo.configure(".", background=COR_FUNDO, foreground=COR_TEXTO,
-                         focuscolor=COR_PAINEL)
-        # Botão principal: cor sólida, sem borda
-        estilo.configure("Primario.TButton", background=COR_DESTAQUE, foreground="white",
-                         bordercolor=COR_DESTAQUE, lightcolor=COR_DESTAQUE,
-                         darkcolor=COR_DESTAQUE, padding=(18, 8), focusthickness=0)
-        estilo.map("Primario.TButton",
-                   background=[("disabled", "#b9c7c2"), ("active", COR_DESTAQUE_ATIVO)],
-                   bordercolor=[("disabled", "#b9c7c2"), ("active", COR_DESTAQUE_ATIVO)],
-                   lightcolor=[("disabled", "#b9c7c2"), ("active", COR_DESTAQUE_ATIVO)],
-                   darkcolor=[("disabled", "#b9c7c2"), ("active", COR_DESTAQUE_ATIVO)],
-                   foreground=[("disabled", "#f4f6f5")])
-        # Botões secundários: fundo branco e borda fina
-        for nome in ("Secundario.TButton", "Secundario.TMenubutton"):
-            estilo.configure(nome, background=COR_PAINEL, foreground=COR_TEXTO,
-                             bordercolor=COR_BORDA, lightcolor=COR_PAINEL,
-                             darkcolor=COR_PAINEL, padding=(14, 8), focusthickness=0,
-                             arrowcolor=COR_SECUNDARIA)
-            estilo.map(nome, background=[("active", "#f1f3f5")],
-                       foreground=[("disabled", "#a8adb5")],
-                       arrowcolor=[("disabled", "#c9cdd3")])
-        # Botões discretos (copiar, fechar)
-        estilo.configure("Discreto.TButton", background=COR_PAINEL, foreground=COR_SECUNDARIA,
-                         bordercolor=COR_PAINEL, lightcolor=COR_PAINEL, darkcolor=COR_PAINEL,
-                         padding=(8, 4), focusthickness=0)
-        estilo.map("Discreto.TButton", background=[("active", "#f1f3f5")],
-                   foreground=[("active", COR_TEXTO)])
-        # Alternador P&B / Cor
-        estilo.configure("Alternar.Toolbutton", background=COR_PAINEL,
-                         foreground=COR_SECUNDARIA, padding=(10, 3), focusthickness=0,
-                         bordercolor=COR_BORDA, lightcolor=COR_PAINEL, darkcolor=COR_PAINEL)
-        estilo.map("Alternar.Toolbutton",
-                   background=[("selected", "#e6efeb"), ("active", "#f1f3f5")],
-                   foreground=[("selected", COR_DESTAQUE), ("disabled", "#c9cdd3")])
-        estilo.configure("Vertical.TScrollbar", background="#e5e7eb", troughcolor=COR_PAINEL,
-                         bordercolor=COR_PAINEL, lightcolor="#e5e7eb", darkcolor="#e5e7eb",
-                         arrowsize=0, gripcount=0)
-        estilo.map("Vertical.TScrollbar", background=[("active", "#cfd3d9")])
-        estilo.configure("Horizontal.TProgressbar", background=COR_DESTAQUE,
-                         troughcolor="#e5e7eb", bordercolor="#e5e7eb",
-                         lightcolor=COR_DESTAQUE, darkcolor=COR_DESTAQUE)
+        tk.Label(barra, text="NOVO SCAN", bg=self.COR_BARRA, fg=self.COR_SECUNDARIA,
+                 font=("Arial", 14, "bold")).pack(anchor="w")
 
-    def _montar_cabecalho(self):
-        cabecalho = tk.Frame(self.root, bg=COR_PAINEL, padx=24, pady=14)
-        cabecalho.pack(side="top", fill="x")
-        tk.Frame(self.root, bg=COR_BORDA, height=1).pack(side="top", fill="x")
+        self.btn_carregar = self._botao(barra, "+  Escolher arquivo", self.carregar,
+                                        self.COR_PRIMARIA, self.COR_TEXTO)
+        self.btn_carregar.pack(fill="x", pady=(18, 4))
 
-        tk.Label(cabecalho, text="Scanner de Documentos", font=self.fonte_titulo,
-                 bg=COR_PAINEL, fg=COR_TEXTO).pack(side="left")
-        self.info = tk.StringVar(value="")
-        tk.Label(cabecalho, textvariable=self.info, bg=COR_PAINEL,
-                 fg=COR_SECUNDARIA).pack(side="left", padx=(14, 0), pady=(3, 0))
+        self.btn_camera = self._botao(barra, "Câmera ao vivo", self.alternar_camera,
+                                      self.COR_SECUNDARIA, "white")
+        self.btn_camera.pack(fill="x", pady=4)
 
-        # Da direita para a esquerda: Salvar ▾, Extrair texto, Abrir imagem
-        self.btn_salvar = ttk.Menubutton(cabecalho, text="Salvar", width=7,
-                                         style="Secundario.TMenubutton")
-        self.menu_salvar = tk.Menu(self.btn_salvar, tearoff=False)
-        self.menu_salvar.add_command(label="Imagem digitalizada (.png)", command=self.salvar)
-        self.menu_salvar.add_command(label="Texto extraído (.txt)", command=self.salvar_texto)
-        self.btn_salvar["menu"] = self.menu_salvar
-        self.btn_salvar.pack(side="right")
+        self.btn_capturar = self._botao(barra, "Capturar quadro", self.capturar_quadro,
+                                        self.COR_PRIMARIA, self.COR_TEXTO)
+        self.btn_capturar.pack(fill="x", pady=4)
 
-        self.btn_ocr = ttk.Button(cabecalho, text="Extrair texto",
-                                  command=self.executar_ocr, style="Primario.TButton")
-        self.btn_ocr.pack(side="right", padx=8)
+        self.btn_ajustar = self._botao(barra, "Ajustar cantos", self.ajustar_cantos,
+                                       self.COR_SECUNDARIA, "white")
+        self.btn_ajustar.pack(fill="x", pady=4)
 
-        self.btn_carregar = ttk.Button(cabecalho, text="Abrir imagem",
-                                       command=self.carregar, style="Secundario.TButton")
-        self.btn_carregar.pack(side="right")
+        self.status_ocr = tk.StringVar(value="Escolha uma imagem ou inicie a câmera.")
+        tk.Label(barra, textvariable=self.status_ocr, bg=self.COR_BARRA, fg=self.COR_TEXTO,
+                 wraplength=200, justify="left", font=("Arial", 10)).pack(
+                     fill="x", pady=(8, 8))
 
-        self.btn_camera = ttk.Button(cabecalho, text="Câmera ao vivo",
-                                      command=self.alternar_camera, style="Secundario.TButton")
-        self.btn_camera.pack(side="right", padx=8)
+        # Começa escondida; é exibida só durante o processamento
+        self.progresso_ocr = ttk.Progressbar(barra, mode="indeterminate")
 
-        self.btn_capturar = ttk.Button(cabecalho, text="Capturar",
-                                       command=self.capturar_quadro,
-                                       style="Primario.TButton", state="disabled")
-        self.btn_capturar.pack(side="right")
+        cartao = tk.Frame(barra, bg=self.COR_CARTAO, padx=12, pady=12,
+                          highlightbackground=self.COR_BORDA, highlightthickness=1)
+        cartao.pack(fill="x", pady=24)
 
-    def _montar_rodape(self):
-        rodape = tk.Frame(self.root, bg=COR_PAINEL, padx=24, pady=6)
-        rodape.pack(side="bottom", fill="x")
-        tk.Frame(self.root, bg=COR_BORDA, height=1).pack(side="bottom", fill="x")
-        self.status = tk.StringVar(value="Abra uma imagem para começar.")
-        tk.Label(rodape, textvariable=self.status, bg=COR_PAINEL,
-                 fg=COR_SECUNDARIA).pack(side="left")
-        # A barra de progresso só aparece enquanto o OCR está rodando.
-        self.progresso = ttk.Progressbar(rodape, mode="indeterminate", length=160)
+        tk.Label(cartao, text="Avaliação do OCR", bg=self.COR_CARTAO,
+                 fg=self.COR_SECUNDARIA, font=("Arial", 10, "bold")).pack(anchor="w")
+        self.resumo_ocr = tk.StringVar(value="Processe a imagem para ver a avaliação.")
+        tk.Label(cartao, textvariable=self.resumo_ocr, bg=self.COR_CARTAO,
+                 fg=self.COR_TEXTO, wraplength=200, justify="left",
+                 anchor="w").pack(fill="x", pady=(8, 8))
+        tk.Label(cartao, text="Estimativa automática.",
+                 bg=self.COR_CARTAO, fg=self.COR_SUAVE, wraplength=200,
+                 justify="left", font=("Arial", 8)).pack(fill="x")
 
-    def _montar_conteudo(self):
-        self.conteudo = tk.Frame(self.root, bg=COR_FUNDO, padx=24, pady=20)
-        self.conteudo.pack(fill="both", expand=True)
+    def _montar_area_principal(self):
+        principal = tk.Frame(self.root, bg=self.COR_FUNDO, padx=24, pady=20)
+        principal.pack(side="left", fill="both", expand=True)
 
-        self.area_imagens = tk.Frame(self.conteudo, bg=COR_FUNDO)
-        self.area_imagens.pack(side="left", fill="both", expand=True)
-        for coluna, (chave, titulo, vazio) in enumerate((
-            ("original", "ORIGINAL", "Abra uma imagem para começar"),
-            ("warped", "DIGITALIZADO", "O documento digitalizado aparece aqui"),
-        )):
-            self.visores[chave] = self._criar_cartao(self.area_imagens, titulo, vazio, chave)
-            self.visores[chave].master.grid(row=0, column=coluna, sticky="nsew",
-                                            padx=(0, 10) if coluna == 0 else (10, 0))
-            self.area_imagens.grid_columnconfigure(coluna, weight=1, uniform="cartao")
-        self.area_imagens.grid_rowconfigure(0, weight=1)
-        self.area_imagens.bind("<Configure>", self._agendar_redimensionamento)
+        principal.grid_columnconfigure(0, weight=1)
+        principal.grid_rowconfigure(2, weight=4)   # imagens
+        principal.grid_rowconfigure(4, weight=1)   # texto extraído
 
-        # Extras discretos nos cabeçalhos dos cartões
-        self.btn_ajustar = ttk.Button(self.cabecalhos["original"], text="Ajustar cantos",
-                                      command=self.ajustar_cantos, style="Discreto.TButton")
-        self.btn_ajustar.pack(side="right")
-        self.alternadores = []
-        for texto, valor in (("Cor", "cor"), ("P&B", "pb")):
-            botao = ttk.Radiobutton(self.cabecalhos["warped"], text=texto, value=valor,
-                                    variable=self.modo_saida, style="Alternar.Toolbutton",
-                                    command=self._exibir_digitalizado)
-            botao.pack(side="right")
-            self.alternadores.append(botao)
+        tk.Label(principal, text="VISUALIZAÇÃO", bg=self.COR_FUNDO, fg=self.COR_SUAVE,
+                 font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w")
 
-        self._montar_painel_texto()
+        # Abas: escolhem quais etapas aparecem
+        abas = tk.Frame(principal, bg=self.COR_FUNDO)
+        abas.grid(row=1, column=0, sticky="w", pady=(6, 16))
+        for chave, rotulo, _, _, _ in self.MODOS:
+            botao = tk.Button(
+                abas, text=rotulo, relief="flat", bd=0, font=("Arial", 10, "bold"),
+                padx=16, pady=8, cursor="hand2",
+                command=lambda c=chave: self._selecionar_modo(c))
+            botao.pack(side="left", padx=(0, 8))
+            self.botoes_modo[chave] = botao
 
-    def _criar_cartao(self, pai, titulo, vazio, chave):
-        cartao = tk.Frame(pai, bg=COR_PAINEL, highlightthickness=1,
-                          highlightbackground=COR_BORDA, padx=16, pady=12)
-        # Sem propagate, o tamanho do cartão vem da grade, não da imagem.
-        cartao.pack_propagate(False)
-        cabecalho = tk.Frame(cartao, bg=COR_PAINEL, height=28)
-        cabecalho.pack(fill="x", pady=(0, 8))
-        cabecalho.pack_propagate(False)
-        tk.Label(cabecalho, text=titulo, font=self.fonte_rotulo, bg=COR_PAINEL,
-                 fg=COR_SECUNDARIA).pack(side="left")
-        self.cabecalhos[chave] = cabecalho
-        visor = tk.Label(cartao, text=vazio, bg=COR_PAINEL, fg="#9ca3af", cursor="hand2")
-        visor.pack(fill="both", expand=True)
-        visor.bind("<Button-1>", lambda _e: self.ampliar(chave, titulo.capitalize()))
-        return visor
+        # Área das imagens (a grade é montada em _atualizar_layout)
+        self.area_imagens = tk.Frame(principal, bg=self.COR_FUNDO)
+        self.area_imagens.grid(row=2, column=0, sticky="nsew")
+        for chave in self.TITULOS:
+            self.cartoes[chave] = self._criar_cartao(self.area_imagens, self.TITULOS[chave], chave)
 
-    def _montar_painel_texto(self):
-        """Painel lateral com o texto do OCR. Só aparece depois da extração."""
-        self.painel_texto = tk.Frame(self.conteudo, bg=COR_PAINEL, highlightthickness=1,
-                                     highlightbackground=COR_BORDA, width=360,
-                                     padx=16, pady=12)
-        self.painel_texto.pack_propagate(False)
+        # Ações abaixo das imagens
+        acoes = tk.Frame(principal, bg=self.COR_FUNDO)
+        acoes.grid(row=3, column=0, pady=18)
 
-        topo = tk.Frame(self.painel_texto, bg=COR_PAINEL)
-        topo.pack(fill="x")
-        tk.Label(topo, text="TEXTO EXTRAÍDO", font=self.fonte_rotulo, bg=COR_PAINEL,
-                 fg=COR_SECUNDARIA).pack(side="left")
-        ttk.Button(topo, text="✕", width=3, command=self._esconder_texto,
-                   style="Discreto.TButton").pack(side="right")
-        self.btn_copiar = ttk.Button(topo, text="Copiar", command=self.copiar_texto,
-                                     style="Discreto.TButton")
-        self.btn_copiar.pack(side="right")
+        self.btn_processar = self._botao(acoes, "Processar", self.processar,
+                                         self.COR_PRIMARIA, self.COR_TEXTO, padx=30)
+        self.btn_processar.pack(side="left", padx=6)
 
-        self.resumo_ocr = tk.StringVar(value="")
-        tk.Label(self.painel_texto, textvariable=self.resumo_ocr, bg=COR_PAINEL,
-                 fg=COR_SECUNDARIA, justify="left", anchor="w").pack(fill="x", pady=(4, 10))
+        self.frame_salvar = tk.Frame(acoes, bg=self.COR_FUNDO)
+        self.frame_salvar.pack(side="left")
 
-        moldura = tk.Frame(self.painel_texto, bg=COR_PAINEL)
-        moldura.pack(fill="both", expand=True)
-        self.caixa_texto = tk.Text(moldura, wrap="word", relief="flat", bd=0,
-                                   bg="#fafafa", fg=COR_TEXTO, padx=10, pady=8,
-                                   highlightthickness=0, undo=True,
-                                   font=(tkfont.nametofont("TkDefaultFont").actual("family"), 10))
-        rolagem = ttk.Scrollbar(moldura, command=self.caixa_texto.yview)
-        self.caixa_texto.configure(yscrollcommand=rolagem.set)
-        rolagem.pack(side="right", fill="y")
+        self.btn_salvar = self._botao(self.frame_salvar, "Salvar imagem (cor)",
+                                      lambda: self.salvar("cor"),
+                                      self.COR_SECUNDARIA, "white")
+        self.btn_salvar.pack(side="left", padx=6)
+
+        self.btn_salvar_pb = self._botao(self.frame_salvar, "Salvar imagem (P&B)",
+                                         lambda: self.salvar("pb"),
+                                         self.COR_SECUNDARIA, "white")
+        self.btn_salvar_pb.pack(side="left", padx=6)
+
+        self.btn_salvar_texto = self._botao(self.frame_salvar, "Salvar texto (.txt)",
+                                            self.salvar_texto,
+                                            self.COR_SECUNDARIA, "white")
+        self.btn_salvar_texto.pack(side="left", padx=6)
+
+        # Texto extraído (aparece nas abas que o mostram) e editável
+        self.quadro_texto = tk.LabelFrame(principal, text="Texto extraído", bg=self.COR_FUNDO,
+                                          fg=self.COR_SECUNDARIA, font=("Arial", 10, "bold"),
+                                          padx=8, pady=8)
+        self.quadro_texto.grid(row=4, column=0, sticky="nsew")
+
+        barra_rolagem = tk.Scrollbar(self.quadro_texto)
+        barra_rolagem.pack(side="right", fill="y")
+        self.caixa_texto = tk.Text(
+            self.quadro_texto, wrap="word", height=4,
+            bg=self.COR_CARTAO, fg=self.COR_TEXTO, relief="flat",
+            padx=10, pady=10, undo=True, yscrollcommand=barra_rolagem.set)
         self.caixa_texto.pack(side="left", fill="both", expand=True)
+        barra_rolagem.config(command=self.caixa_texto.yview)
+        self.caixa_texto.bind("<KeyRelease>", lambda _e: self._definir_estado_botoes())
 
-    def _mostrar_painel_texto(self):
-        if not self.painel_texto.winfo_ismapped():
-            self.painel_texto.pack(side="right", fill="y", padx=(20, 0),
-                                   before=self.area_imagens)
+    def _criar_cartao(self, pai, titulo, chave):
+        cartao = tk.Frame(pai, bg=self.COR_CARTAO,
+                          highlightbackground=self.COR_BORDA, highlightthickness=1)
 
-    def _esconder_texto(self):
-        self.painel_texto.pack_forget()
+        tk.Label(cartao, text=titulo, bg=self.COR_CARTAO, fg=self.COR_SUAVE,
+                 font=("Arial", 9, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
 
-    def _atualizar_botoes(self):
-        """Habilita cada ação só quando ela faz sentido."""
-        livre = not self.processando_ocr
+        area = tk.Frame(cartao, bg=self.COR_CARTAO)
+        area.pack(fill="both", expand=True, padx=8, pady=8)
+        area.bind("<Configure>", lambda _e, c=chave: self._agendar_redimensionamento(c))
+        self.areas[chave] = area
+
+        label = tk.Label(area, text="Aguardando", bg=self.COR_CARTAO,
+                         fg=self.COR_TEXTO_DESATIVADO)
+        label.place(relx=0.5, rely=0.5, anchor="center")
+        self.labels[chave] = label
+        return cartao
+
+    def _botao(self, pai, texto, comando, cor, cor_texto, padx=20):
+        botao = tk.Button(
+            pai, text=texto, command=comando, font=("Arial", 11, "bold"),
+            bg=cor, fg=cor_texto, relief="flat", bd=0, padx=padx, pady=8,
+            activebackground=cor, activeforeground=cor_texto,
+            disabledforeground=self.COR_TEXTO_DESATIVADO)
+        self.cores[botao] = (cor, cor_texto)
+        return botao
+
+    def _aplicar_estado(self, botao, ativo):
+        if ativo:
+            bg, fg = self.cores[botao]
+            botao.config(state="normal", bg=bg, fg=fg, activebackground=bg, cursor="hand2")
+        else:
+            botao.config(state="disabled", bg=self.COR_DESATIVADA,
+                         fg=self.COR_TEXTO_DESATIVADO,
+                         disabledforeground=self.COR_TEXTO_DESATIVADO, cursor="arrow")
+
+    def _definir_estado_botoes(self):
+        ocupado = self.processando
         camera_ativa = self.camera is not None
-        tem_scan = self.warped is not None and not camera_ativa
-        tem_texto = bool(self.texto_ocr.strip())
+        tem_imagem = self.imagem is not None and not camera_ativa
 
-        def estado(condicao):
-            return "normal" if condicao and livre else "disabled"
+        self._aplicar_estado(self.btn_carregar, not ocupado)
+        self._aplicar_estado(self.btn_camera, not ocupado)
+        self.btn_camera.config(text="Fechar câmera" if camera_ativa else "Câmera ao vivo")
+        self._aplicar_estado(self.btn_capturar, not ocupado and camera_ativa)
+        self._aplicar_estado(self.btn_ajustar, not ocupado and tem_imagem)
+        self._aplicar_estado(self.btn_processar, not ocupado and tem_imagem)
+        self._aplicar_estado(self.btn_salvar, not ocupado and self.warped is not None)
+        self._aplicar_estado(self.btn_salvar_pb, not ocupado and self.scan_pb is not None)
+        self._aplicar_estado(self.btn_salvar_texto,
+                             not ocupado and bool(self._texto_atual().strip()))
 
-        self.btn_carregar.config(state=estado(not camera_ativa))
-        self.btn_camera.config(
-            state=estado(True),
-            text="Fechar câmera" if camera_ativa else "Câmera ao vivo"
-        )
-        self.btn_capturar.config(state=estado(camera_ativa))
-        self.btn_ocr.config(state=estado(tem_scan),
-                            text="Ver texto" if tem_texto else "Extrair texto")
-        self.btn_salvar.config(state=estado(tem_scan))
-        self.btn_ajustar.config(state=estado(self.imagem is not None and not camera_ativa))
-        for botao in self.alternadores:
-            botao.config(state=estado(tem_scan))
-        self.menu_salvar.entryconfig(0, state=estado(tem_scan))
-        self.menu_salvar.entryconfig(1, state=estado(tem_texto))
+    def _iniciar_progresso(self):
+        self.progresso_ocr.pack(fill="x")
+        self.progresso_ocr.start(12)
 
-    # ----------------------------------------------------------------- câmera ao vivo
+    def _encerrar_progresso(self):
+        self.progresso_ocr.stop()
+        self.progresso_ocr.pack_forget()
+
+    def _selecionar_modo(self, modo):
+        self.modo = modo
+        for chave, botao in self.botoes_modo.items():
+            ativa = chave == modo
+            botao.config(
+                bg=self.COR_SECUNDARIA if ativa else self.COR_CARTAO,
+                fg="white" if ativa else self.COR_SECUNDARIA,
+                activebackground=self.COR_SECUNDARIA if ativa else self.COR_CARTAO,
+                activeforeground="white" if ativa else self.COR_SECUNDARIA)
+        self._atualizar_layout()
+
+    def _config_modo(self):
+        for chave, _, imagens, mostra_texto, mostra_salvar in self.MODOS:
+            if chave == self.modo:
+                return imagens, mostra_texto, mostra_salvar
+        return ("original",), False, False
+
+    def _atualizar_layout(self):
+        imagens, mostra_texto, mostra_salvar = self._config_modo()
+
+        for cartao in self.cartoes.values():
+            cartao.grid_forget()
+        for i in range(len(self.cartoes)):
+            self.area_imagens.grid_columnconfigure(i, weight=0, uniform="")
+            self.area_imagens.grid_rowconfigure(i, weight=0)
+
+        # Até 3 cartões por linha; a grade cresce para baixo
+        colunas = min(len(imagens), 3)
+        linhas = (len(imagens) + colunas - 1) // colunas
+        for c in range(colunas):
+            self.area_imagens.grid_columnconfigure(c, weight=1, uniform="cartoes")
+        for r in range(linhas):
+            self.area_imagens.grid_rowconfigure(r, weight=1)
+
+        for i, chave in enumerate(imagens):
+            self.cartoes[chave].grid(row=i // colunas, column=i % colunas,
+                                     padx=6, pady=6, sticky="nsew")
+
+        if mostra_texto:
+            self.quadro_texto.grid()
+        else:
+            self.quadro_texto.grid_remove()
+
+        if mostra_salvar:
+            self.frame_salvar.pack(side="left")
+        else:
+            self.frame_salvar.pack_forget()
+
+        for chave in imagens:
+            self._agendar_redimensionamento(chave)
+
+    #câmera ao vivo
     def alternar_camera(self):
-        """Abre a câmera ou encerra a captura, conforme o estado atual."""
         if self.camera is not None:
             self.parar_camera()
         else:
             self.iniciar_camera()
 
     def iniciar_camera(self):
-        """Abre a câmera padrão e inicia a atualização do quadro na interface."""
-        if self.processando_ocr:
+        if self.processando:
             return
 
         camera = cv2.VideoCapture(INDICE_CAMERA)
@@ -647,38 +705,23 @@ class ImagePreprocessorApp:
             )
             return
 
-        # A câmera pode não aceitar exatamente a resolução solicitada; o tamanho
-        # real será lido de cada quadro recebido.
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.camera = camera
         self.camera_frame = None
         self.camera_cantos = None
 
-        # Ao entrar no modo câmera, descarta o resultado da imagem anterior.
+        # Ao entrar no modo câmera, descarta o resultado anterior
         self.imagem = None
         self.nome_arquivo = ""
-        self.cantos = None
-        self.warped = None
-        self.scan_pb = None
-        self.texto_ocr = ""
-        self._definir_texto("")
-        self._esconder_texto()
-        self.info.set("Câmera ao vivo")
+        self._limpar_resultados()
+        self._limpar_imagens(("original",), "Inicializando câmera…")
 
-        self.imagens.pop("original", None)
-        self.imagens.pop("warped", None)
-        self.fotos.pop("original", None)
-        self.fotos.pop("warped", None)
-        self.visores["original"].config(image="", text="Inicializando câmera…")
-        self.visores["warped"].config(image="", text="Aponte para um documento")
-
-        self.status.set("Câmera iniciada. Posicione a folha dentro do enquadramento.")
-        self._atualizar_botoes()
+        self.status_ocr.set("Câmera iniciada. Posicione a folha no enquadramento.")
+        self._definir_estado_botoes()
         self._atualizar_camera()
 
     def _atualizar_camera(self):
-        """Lê e processa um quadro, atualizando os dois visores da interface."""
         self.camera_after_id = None
         if self.camera is None:
             return
@@ -686,78 +729,47 @@ class ImagePreprocessorApp:
         sucesso, frame = self.camera.read()
         if not sucesso or frame is None:
             self.parar_camera()
-            messagebox.showerror(
-                "Falha na câmera",
-                "A câmera foi aberta, mas não foi possível receber a imagem."
-            )
+            messagebox.showerror("Falha na câmera",
+                                 "A câmera foi aberta, mas não foi possível receber a imagem.")
             return
 
         self.camera_frame = frame.copy()
         try:
             cantos, encontrou = scan_detection(frame)
-            if encontrou:
-                self.camera_cantos = cantos.copy()
-                visualizacao = desenhar_contorno(frame, cantos)
-                previa = four_point_transform(frame, cantos)
-            else:
-                self.camera_cantos = None
-                visualizacao = frame
-                previa = None
+            previa = four_point_transform(frame, cantos) if encontrou else None
         except Exception as erro:
             self.parar_camera()
-            messagebox.showerror(
-                "Erro no processamento da câmera",
-                f"Não foi possível processar o quadro recebido:\n{erro}"
-            )
+            messagebox.showerror("Erro no processamento da câmera",
+                                 f"Não foi possível processar o quadro recebido:\n{erro}")
             return
 
-        self.mostrar("original", visualizacao)
-        altura, largura = frame.shape[:2]
-        self.info.set(f"Câmera ao vivo  ·  {largura} × {altura} px")
-
-        if previa is not None:
-            # Na prévia ao vivo mostramos a retificação colorida. O efeito de
-            # scanner completo é aplicado apenas quando o usuário captura.
+        if encontrou and previa is not None:
+            self.camera_cantos = cantos.copy()
+            self.mostrar("original", desenhar_contorno(frame, cantos))
             self.mostrar("warped", previa)
-            self.status.set("Documento detectado. Pressione Capturar para digitalizar.")
+            self.status_ocr.set("Documento detectado. Capture o quadro para digitalizar.")
         else:
-            self.visores["warped"].config(image="", text="Documento não detectado")
-            self.imagens.pop("warped", None)
-            self.fotos.pop("warped", None)
-            self.status.set("Aponte a câmera para uma folha com os quatro cantos visíveis.")
+            self.camera_cantos = None
+            self.mostrar("original", frame)
+            self._limpar_imagens(("warped",), "Documento não detectado")
+            self.status_ocr.set("Aponte para uma folha com os quatro cantos visíveis.")
 
-        # O intervalo é contado após o processamento do quadro. Se o algoritmo
-        # demorar mais, a interface não acumula quadros atrasados.
+        # O intervalo é contado após o processamento, então quadros não se acumulam
         self.camera_after_id = self.root.after(40, self._atualizar_camera)
 
     def capturar_quadro(self):
-        """Congela o quadro atual e o envia ao fluxo normal do scanner."""
         if self.camera is None or self.camera_frame is None:
             return
 
         frame = self.camera_frame.copy()
         cantos = self.camera_cantos.copy() if self.camera_cantos is not None else None
+        self.parar_camera(atualizar_status=False)
 
-        self.parar_camera(atualizar_botoes=False)
         self.imagem = frame
         self.nome_arquivo = time.strftime("captura_%Y%m%d_%H%M%S.jpg")
-        altura, largura = frame.shape[:2]
-        self.info.set(f"{self.nome_arquivo}  ·  {largura} × {altura} px")
+        self._iniciar_processamento(cantos)
 
-        # Se os cantos foram encontrados no vídeo, reutiliza-os. Caso contrário,
-        # tenta novamente a detecção automática e o usuário poderá ajustá-los.
-        self.processar(cantos)
-        if cantos is not None and self.warped is not None:
-            self.status.set("Captura realizada e documento detectado. Clique em Extrair texto.")
-        elif self.warped is not None:
-            self.status.set(
-                "Captura realizada, mas o documento não foi detectado com segurança. "
-                "Use Ajustar cantos para marcar a folha."
-            )
-        self._atualizar_botoes()
-
-    def parar_camera(self, atualizar_botoes=True):
-        """Cancela a atualização periódica e libera o dispositivo de câmera."""
+    def parar_camera(self, atualizar_status=True):
         if self.camera_after_id is not None:
             try:
                 self.root.after_cancel(self.camera_after_id)
@@ -772,23 +784,21 @@ class ImagePreprocessorApp:
         if camera is not None:
             camera.release()
 
-        if atualizar_botoes and hasattr(self, "btn_camera"):
-            self.status.set("Câmera encerrada. Abra uma imagem ou inicie a câmera novamente.")
-            self._atualizar_botoes()
+        if atualizar_status:
+            self.status_ocr.set("Câmera encerrada. Escolha uma imagem ou inicie a câmera.")
+        self._definir_estado_botoes()
 
     def fechar(self):
-        """Libera a câmera antes de fechar a aplicação."""
-        self.parar_camera(atualizar_botoes=False)
+        self.parar_camera(atualizar_status=False)
         self.root.destroy()
 
-    # ----------------------------------------------------------------- ações
+    # ações
     def carregar(self):
-        if self.processando_ocr:
+        if self.processando:
             return
         if self.camera is not None:
-            self.parar_camera()
+            self.parar_camera(atualizar_status=False)
 
-        # askopenfilename abre a janela nativa do sistema para escolher um arquivo
         caminho = filedialog.askopenfilename(
             filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
                        ("Todos os arquivos", "*.*")]
@@ -803,71 +813,153 @@ class ImagePreprocessorApp:
 
         self.imagem = imagem
         self.nome_arquivo = os.path.basename(caminho)
-        altura, largura = imagem.shape[:2]
-        self.info.set(f"{self.nome_arquivo}  ·  {largura} × {altura} px")
-        # A digitalização é rápida, então acontece logo ao abrir a imagem.
-        self.processar()
+        self._limpar_resultados()
+        self.mostrar("original", imagem)
+        self.status_ocr.set("Imagem carregada. Clique em Processar.")
+        self._definir_estado_botoes()
 
-    def processar(self, cantos=None):
-        """Recorta o documento. Sem cantos, eles são detectados automaticamente."""
-        manual = cantos is not None
-        if manual:
-            encontrou = True
-        else:
-            cantos, encontrou = scan_detection(self.imagem)
-        self.cantos = cantos
-        # Um recorte novo invalida o texto lido antes.
+    def processar(self):
+        if self.imagem is None or self.processando:
+            return
+        self._iniciar_processamento(None)
+
+    def _limpar_resultados(self):
+        self.cantos = None
+        self.documento_encontrado = False
+        self.warped = None
+        self.scan_pb = None
         self.texto_ocr = ""
-        self._definir_texto("")
-        self._esconder_texto()
+        self.resumo_ocr.set("Processe a imagem para ver a avaliação.")
+        self.mostrar_texto("")
+        self._limpar_imagens(self.CARTOES_PROCESSO, "Aguardando")
 
-        self.mostrar("original", desenhar_contorno(self.imagem, cantos)
-                     if encontrou else self.imagem)
-        self.warped = four_point_transform(self.imagem, cantos)
+    def _iniciar_processamento(self, cantos_manuais=None):
+        """Roda todas as etapas em segundo plano: pré-processamento, detecção,
+        digitalização, efeito de scanner e OCR. Os resultados chegam pela fila."""
+        if self.imagem is None or self.processando:
+            return
 
-        if self.warped is None:
-            self.scan_pb = None
-            self.visores["warped"].config(image="", text="Não foi possível digitalizar")
-            self.imagens.pop("warped", None)
-            self.status.set("Não foi possível aplicar a transformação de perspectiva.")
-        else:
-            self.scan_pb = efeito_scanner(self.warped)
-            self._exibir_digitalizado()
-            if manual:
-                self.status.set("Cantos ajustados. Clique em Extrair texto.")
-            elif encontrou:
-                self.status.set("Documento detectado. Clique em Extrair texto.")
-            else:
-                self.status.set("Documento não detectado: a imagem inteira foi usada. "
-                                "Use Ajustar cantos para marcar a folha.")
-        self._atualizar_botoes()
+        self._limpar_resultados()
+        self.mostrar("original", self.imagem)
+        self.processando = True
+        self.status_ocr.set("Pré-processando a imagem…")
+        self._iniciar_progresso()
+        self._definir_estado_botoes()
 
-    def _imagem_digitalizada(self):
-        """A versão mostrada e salva: escaneada (P&B) ou colorida."""
-        if self.modo_saida.get() == "pb" and self.scan_pb is not None:
-            return self.scan_pb
-        return self.warped
+        imagem = self.imagem.copy()
+        manual = cantos_manuais is not None
+        cantos_entrada = cantos_manuais.copy() if manual else None
 
-    def _exibir_digitalizado(self):
-        if self.warped is not None:
-            self.mostrar("warped", self._imagem_digitalizada())
+        def trabalho():
+            try:
+                cinza, desfocada, binaria = preprocessamento(imagem)
+                self.fila.put(("pre", (cinza, desfocada, binaria)))
+
+                if manual:
+                    cantos, encontrou = cantos_entrada, True
+                else:
+                    self.fila.put(("etapa", "Detectando o documento…"))
+                    cantos, encontrou = scan_detection(imagem)
+                contorno = desenhar_contorno(imagem, cantos) if encontrou else imagem
+                self.fila.put(("deteccao", (cantos, encontrou, contorno)))
+
+                warped = four_point_transform(imagem, cantos)
+                if warped is None:
+                    raise ValueError("Não foi possível aplicar a transformação de perspectiva.")
+                self.fila.put(("digitalizada", (warped, efeito_scanner(warped))))
+
+                resultado = extrair_texto(
+                    warped,
+                    progresso=lambda etapa, _img: self.fila.put(("etapa", etapa)),
+                    retornar_detalhes=True,
+                )
+                self.fila.put(("resultado", resultado))
+            except Exception as erro:
+                self.fila.put(("erro", str(erro)))
+
+        Thread(target=trabalho, daemon=True).start()
+        self.root.after(80, self._acompanhar)
+
+    def _acompanhar(self):
+        # Só a thread principal mexe na interface
+        try:
+            while True:
+                tipo, dados = self.fila.get_nowait()
+
+                if tipo == "etapa":
+                    self.status_ocr.set(dados)
+                    continue
+
+                if tipo == "pre":
+                    for chave, imagem in zip(("gray", "blur", "threshold"), dados):
+                        self.mostrar(chave, imagem)
+                    continue
+
+                if tipo == "deteccao":
+                    cantos, encontrou, contorno = dados
+                    self.cantos = cantos
+                    self.documento_encontrado = encontrou
+                    self.mostrar("contorno", contorno)
+                    if not encontrou:
+                        self.status_ocr.set("Documento não detectado: a imagem inteira foi "
+                                            "usada. Use Ajustar cantos.")
+                    continue
+
+                if tipo == "digitalizada":
+                    self.warped, self.scan_pb = dados
+                    self.mostrar("warped", self.warped)
+                    self.mostrar("pb", self.scan_pb)
+                    continue
+
+                # Daqui em diante o processamento terminou
+                self.processando = False
+                self._encerrar_progresso()
+
+                if tipo == "erro":
+                    self.status_ocr.set("Falha ao processar. Confira a mensagem.")
+                    self.resumo_ocr.set("Avaliação indisponível.")
+                    self._definir_estado_botoes()
+                    messagebox.showerror("Erro", dados)
+                    return
+
+                self.texto_ocr = dados["texto"]
+                self._mostrar_avaliacao(dados)
+                self.mostrar_texto(self.texto_ocr)
+
+                if not self.texto_ocr.strip():
+                    self.status_ocr.set("Nenhum texto encontrado.")
+                    messagebox.showinfo("OCR", "Nenhum texto foi encontrado.")
+                elif self.documento_encontrado:
+                    self.status_ocr.set("Pronto. Você pode corrigir o texto e salvar.")
+                else:
+                    self.status_ocr.set("Pronto, mas o documento não foi detectado com "
+                                        "segurança. Confira com Ajustar cantos.")
+                return
+        except Empty:
+            if self.processando:
+                self.root.after(80, self._acompanhar)
+
+    def _mostrar_avaliacao(self, resultado):
+        confianca = f"{resultado['confianca_media']:.1f}".replace(".", ",")
+        self.resumo_ocr.set(
+            f"Letras e números extraídos: {resultado['caracteres_total']}\n\n"
+            f"Em palavras com confiança ≥ {CONFIANCA_MINIMA}: "
+            f"{resultado['caracteres_confiaveis']}\n\n"
+            f"Confiança média das palavras: {confianca} / 100"
+        )
 
     def ajustar_cantos(self):
-        """Abre uma janela para arrastar os 4 cantos da folha com o mouse.
-
-        É a solução quando a detecção automática falha, por exemplo com uma
-        folha branca sobre um fundo branco, em que a borda quase não aparece.
-        """
-        if self.imagem is None or self.processando_ocr:
+        """Janela para arrastar os 4 cantos da folha. Sem detecção, usa a imagem inteira."""
+        if self.imagem is None or self.processando or self.camera is not None:
             return
-        janela = tk.Toplevel(self.root, bg=COR_PAINEL)
+
+        janela = tk.Toplevel(self.root, bg=self.COR_CARTAO)
         janela.title("Ajustar cantos")
         janela.transient(self.root)
         tk.Label(janela, text="Arraste os círculos até os cantos da folha.",
-                 bg=COR_PAINEL, fg=COR_SECUNDARIA).pack(anchor="w", padx=16, pady=(12, 8))
+                 bg=self.COR_CARTAO, fg=self.COR_SUAVE).pack(anchor="w", padx=16, pady=(12, 8))
 
-        # Mostra a foto reduzida para caber na tela; guarda a escala para voltar.
-        pil = self._para_pil(self.imagem)
+        pil = Image.fromarray(self._para_rgb(self.imagem))
         escala = min(self.root.winfo_screenwidth() * 0.8 / pil.width,
                      self.root.winfo_screenheight() * 0.72 / pil.height, 1.0)
         pil = pil.resize((max(1, int(pil.width * escala)), max(1, int(pil.height * escala))),
@@ -877,13 +969,20 @@ class ImagePreprocessorApp:
                            highlightthickness=0, bg="#111111", cursor="crosshair")
         canvas.pack(padx=16)
         canvas.create_image(0, 0, image=foto, anchor="nw")
-        canvas.foto = foto  # mantém a referência
+        canvas.foto = foto
 
-        pontos = [list(p) for p in order_points(self.cantos) * escala]
+        if self.cantos is not None:
+            base = self.cantos
+        else:
+            altura, largura = self.imagem.shape[:2]
+            base = np.array([[0, 0], [largura - 1, 0],
+                             [largura - 1, altura - 1], [0, altura - 1]], np.float32)
+
+        pontos = [list(p) for p in order_points(base) * escala]
         raio = 9
-        poligono = canvas.create_polygon(*[c for p in pontos for c in p], outline="#56a021",
-                                         fill="", width=2)
-        alcas = [canvas.create_oval(0, 0, 0, 0, fill="white", outline="#56a021", width=3)
+        poligono = canvas.create_polygon(*[c for p in pontos for c in p],
+                                         outline="#1FC6A0", fill="", width=2)
+        alcas = [canvas.create_oval(0, 0, 0, 0, fill="white", outline="#1FC6A0", width=3)
                  for _ in pontos]
         arrastando = {"indice": None}
 
@@ -893,7 +992,6 @@ class ImagePreprocessorApp:
                 canvas.coords(alca, x - raio, y - raio, x + raio, y + raio)
 
         def pressionar(evento):
-            # Pega o canto mais próximo do clique (se estiver perto o bastante).
             distancias = [(evento.x - x) ** 2 + (evento.y - y) ** 2 for x, y in pontos]
             indice = int(np.argmin(distancias))
             arrastando["indice"] = indice if distancias[indice] < (raio * 4) ** 2 else None
@@ -922,107 +1020,33 @@ class ImagePreprocessorApp:
                                        "Arraste-os para formar um quadrilátero.", parent=janela)
                 return
             janela.destroy()
-            self.processar(novos / escala)
+            self._iniciar_processamento(novos / escala)
 
-        botoes = tk.Frame(janela, bg=COR_PAINEL)
+        botoes = tk.Frame(janela, bg=self.COR_CARTAO)
         botoes.pack(fill="x", padx=16, pady=12)
-        ttk.Button(botoes, text="Aplicar", command=aplicar,
-                   style="Primario.TButton").pack(side="right")
-        ttk.Button(botoes, text="Cancelar", command=janela.destroy,
-                   style="Secundario.TButton").pack(side="right", padx=8)
-        ttk.Button(botoes, text="Imagem inteira", command=imagem_inteira,
-                   style="Discreto.TButton").pack(side="left")
+        self._botao(botoes, "Aplicar", aplicar, self.COR_PRIMARIA, self.COR_TEXTO).pack(
+            side="right")
+        self._botao(botoes, "Cancelar", janela.destroy, self.COR_DESATIVADA,
+                    self.COR_TEXTO).pack(side="right", padx=8)
+        self._botao(botoes, "Imagem inteira", imagem_inteira, self.COR_DESATIVADA,
+                    self.COR_TEXTO).pack(side="left")
         janela.bind("<Escape>", lambda _e: janela.destroy())
         janela.bind("<Return>", lambda _e: aplicar())
-        janela.grab_set()  # bloqueia a janela principal enquanto ajusta
+        janela.grab_set()
 
-    def executar_ocr(self):
-        if self.processando_ocr or self.warped is None:
-            return
-        # Reutiliza a leitura enquanto a imagem não for trocada.
-        if self.texto_ocr.strip():
-            self._mostrar_painel_texto()
-            return
-        self.processando_ocr = True
-        self._atualizar_botoes()
-        self.status.set("Iniciando OCR…")
-        self.progresso.pack(side="right")
-        self.progresso.start(12)
-        self.inicio_ocr = time.perf_counter()
-        imagem = self.warped.copy()
-
-        # O trabalho pesado não acessa widgets; envia mensagens para a interface.
-        def trabalho():
-            try:
-                resultado = extrair_texto(
-                    imagem, progresso=lambda etapa, _img: self.fila_ocr.put(("etapa", etapa)),
-                    retornar_detalhes=True,
-                )
-                self.fila_ocr.put(("resultado", resultado))
-            except Exception as erro:
-                self.fila_ocr.put(("erro", str(erro)))
-
-        Thread(target=trabalho, daemon=True).start()
-        self.root.after(80, self._acompanhar_ocr)
-
-    def _acompanhar_ocr(self):
-        # Apenas a thread principal modifica a janela do Tkinter.
-        try:
-            while True:
-                tipo, mensagem = self.fila_ocr.get_nowait()
-                if tipo == "etapa":
-                    self.status.set(mensagem)
-                    continue
-                self.processando_ocr = False
-                self.progresso.stop()
-                self.progresso.pack_forget()
-                if tipo == "erro":
-                    self.status.set("Falha no OCR.")
-                    self._atualizar_botoes()
-                    messagebox.showerror("Erro no OCR", mensagem)
-                    return
-                self._mostrar_resultado(mensagem)
-                return
-        except Empty:
-            if self.processando_ocr:
-                self.root.after(80, self._acompanhar_ocr)
-
-    def _mostrar_resultado(self, resultado):
-        segundos = f"{time.perf_counter() - self.inicio_ocr:.1f}".replace(".", ",")
-        self.texto_ocr = resultado["texto"]
-        confianca = f"{resultado['confianca_media']:.0f}"
-        self.resumo_ocr.set(
-            f"Confiança média: {confianca}/100\n"
-            f"{resultado['caracteres_confiaveis']} de {resultado['caracteres_total']} "
-            f"caracteres com confiança ≥ {CONFIANCA_MINIMA}\n"
-            "(estimativa do Tesseract, não é taxa de acerto)"
-        )
-        if self.texto_ocr.strip():
-            self._definir_texto(self.texto_ocr)
-            self.status.set(f"Texto extraído em {segundos} s. Você pode corrigi-lo no painel.")
-        else:
-            self._definir_texto("(Nenhum texto encontrado.)")
-            self.status.set("OCR concluído, mas nenhum texto foi encontrado.")
-        self._mostrar_painel_texto()
-        self._atualizar_botoes()
-
-    def _definir_texto(self, texto):
+    def mostrar_texto(self, texto):
         self.caixa_texto.delete("1.0", "end")
         self.caixa_texto.insert("1.0", texto)
-        self.caixa_texto.edit_reset()
+        self._definir_estado_botoes()
 
-    def _texto_revisado(self):
-        # O usuário pode corrigir o texto na caixa antes de copiar ou salvar.
+    def _texto_atual(self):
+        # Lê o conteúdo da caixa, já com as correções feitas pelo usuário
         return self.caixa_texto.get("1.0", "end-1c")
 
-    def copiar_texto(self):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self._texto_revisado())
-        self.status.set("Texto copiado para a área de transferência.")
-
     def salvar_texto(self):
-        if not self.texto_ocr.strip():
-            messagebox.showwarning("Aviso", "Extraia o texto com OCR antes de salvar.")
+        texto = self._texto_atual()
+        if not texto.strip():
+            messagebox.showwarning("Aviso", "Não há texto para salvar.")
             return
 
         caminho = filedialog.asksaveasfilename(
@@ -1035,79 +1059,73 @@ class ImagePreprocessorApp:
 
         try:
             with open(caminho, "w", encoding="utf-8") as arquivo:
-                arquivo.write(self._texto_revisado())
+                arquivo.write(texto)
         except OSError as erro:
             messagebox.showerror("Erro", f"Não foi possível salvar o texto:\n{erro}")
             return
 
-        self.status.set(f"Texto salvo em {caminho}")
+        messagebox.showinfo("Pronto", f"Texto salvo em:\n{caminho}")
 
-    def salvar(self):
-        if self.warped is None:
-            messagebox.showwarning("Aviso", "Abra uma imagem antes de salvar.")
+    def salvar(self, versao="cor"):
+        imagem = self.warped if versao == "cor" else self.scan_pb
+        if imagem is None:
+            messagebox.showwarning("Aviso", "Processe a imagem antes de salvar.")
             return
 
-        # asksaveasfilename escolhe onde salvar o arquivo
         caminho = filedialog.asksaveasfilename(
             defaultextension=".png",
             filetypes=[("PNG", "*.png")],
-            initialfile="scan_resultado.png",
+            initialfile=f"scan_{'colorido' if versao == 'cor' else 'pb'}.png",
         )
         if not caminho:
             return
 
-        # fromarray cria uma imagem PIL a partir do array NumPy; save grava em PNG
-        self._para_pil(self._imagem_digitalizada()).save(caminho, "PNG")
-        self.status.set(f"Imagem salva em {caminho}")
+        Image.fromarray(self._para_rgb(imagem)).save(caminho, "PNG")
+        messagebox.showinfo("Pronto", f"Salvo em:\n{caminho}")
 
-    # ------------------------------------------------------------- imagens
+    # ----------------------------------------------------------------- imagens
     @staticmethod
-    def _para_pil(array):
+    def _para_rgb(array):
         if array.ndim == 3:
-            array = cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(array)
+            return cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
+        return array
 
     def mostrar(self, chave, array):
-        """Guarda a imagem e a exibe no maior tamanho que cabe no cartão."""
-        self.imagens[chave] = array
-        visor = self.visores[chave]
-        largura = max(visor.winfo_width(), 200)
-        altura = max(visor.winfo_height(), 150)
-        pil = self._para_pil(array)
-        # Ajusta para caber no cartão (amplia ou reduz, mantendo a proporção).
-        escala = min(largura / pil.width, altura / pil.height)
-        tamanho = (max(1, int(pil.width * escala)), max(1, int(pil.height * escala)))
-        pil = pil.resize(tamanho, Image.LANCZOS)
-        self.fotos[chave] = ImageTk.PhotoImage(pil)
-        visor.config(image=self.fotos[chave], text="")
+        # Guarda a imagem em tamanho real, a miniatura é gerada conforme o espaço
+        self.originais[chave] = Image.fromarray(self._para_rgb(array))
+        self._redimensionar(chave)
 
-    def _agendar_redimensionamento(self, _evento):
-        # Espera o usuário parar de arrastar a janela antes de redesenhar.
-        if self._redimensionar_id:
-            self.root.after_cancel(self._redimensionar_id)
-        self._redimensionar_id = self.root.after(120, self._redesenhar_imagens)
+    def _limpar_imagens(self, chaves, texto):
+        for chave in chaves:
+            self.originais.pop(chave, None)
+            self.fotos.pop(chave, None)
+            self.labels[chave].config(image="", text=texto)
 
-    def _redesenhar_imagens(self):
-        self._redimensionar_id = None
-        for chave, array in list(self.imagens.items()):
-            self.mostrar(chave, array)
-
-    def ampliar(self, chave, titulo):
-        """Abre a imagem em tela grande (ótimo para apresentar)."""
-        if chave not in self.imagens:
+    def _agendar_redimensionamento(self, chave):
+        # Junta vários eventos de redimensionamento em um só para a janela não travar
+        if chave not in self.originais:
             return
-        janela = tk.Toplevel(self.root, bg="#111111")
-        janela.title(titulo)
-        pil = self._para_pil(self.imagens[chave])
-        limite = (int(self.root.winfo_screenwidth() * 0.9),
-                  int(self.root.winfo_screenheight() * 0.9))
-        pil.thumbnail(limite, Image.LANCZOS)
-        foto = ImageTk.PhotoImage(pil)
-        rotulo = tk.Label(janela, image=foto, bg="#111111")
-        rotulo.image = foto  # mantém a referência
-        rotulo.pack(padx=10, pady=10)
-        janela.bind("<Escape>", lambda _e: janela.destroy())
-        rotulo.bind("<Button-1>", lambda _e: janela.destroy())
+        if chave in self.agendados:
+            self.root.after_cancel(self.agendados[chave])
+        self.agendados[chave] = self.root.after(60, lambda: self._redimensionar(chave))
+
+    def _redimensionar(self, chave):
+        self.agendados.pop(chave, None)
+        original = self.originais.get(chave)
+        if original is None:
+            return
+
+        area = self.areas[chave]
+        largura = area.winfo_width() - 8
+        altura = area.winfo_height() - 8
+        # Cartão escondido ainda não tem tamanho real: espera o próximo Configure
+        if largura < 20 or altura < 20:
+            return
+
+        pil = original.copy()
+        pil.thumbnail((largura, altura))
+        self.fotos[chave] = ImageTk.PhotoImage(pil)
+        self.labels[chave].config(image=self.fotos[chave], text="")
 
 
 if __name__ == "__main__":
