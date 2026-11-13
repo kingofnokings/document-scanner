@@ -696,6 +696,13 @@ class ImagePreprocessorApp:
 
     CARTOES_PROCESSO = ("contorno", "gray", "blur", "threshold", "warped", "pb")
 
+    # Giros da imagem de entrada: (rótulo do botão, código do cv2.rotate, texto do status)
+    GIROS = (
+        ("90° esq.", cv2.ROTATE_90_COUNTERCLOCKWISE, "90° para a esquerda"),
+        ("180°", cv2.ROTATE_180, "180°"),
+        ("90° dir.", cv2.ROTATE_90_CLOCKWISE, "90° para a direita"),
+    )
+
     def __init__(self, root):
         self.root = root
         self.root.title("Scanner de Documentos")
@@ -724,6 +731,7 @@ class ImagePreprocessorApp:
         self.areas = {}
         self.cartoes = {}
         self.botoes_modo = {}
+        self.botoes_girar = []
         self.cores = {}          # cor original de cada botão (para reativar)
         self.agendados = {}
         self.processando = False
@@ -766,6 +774,20 @@ class ImagePreprocessorApp:
         self.btn_ajustar = self._botao(barra, "Ajustar cantos", self.ajustar_cantos,
                                        self.COR_SECUNDARIA, "white")
         self.btn_ajustar.pack(fill="x", pady=4)
+
+        # Girar a imagem de entrada (ex.: foto de cabeça para baixo)
+        tk.Label(barra, text="GIRAR IMAGEM", bg=self.COR_BARRA, fg=self.COR_SUAVE,
+                 font=("Arial", 9, "bold")).pack(anchor="w", pady=(10, 0))
+        linha_girar = tk.Frame(barra, bg=self.COR_BARRA)
+        linha_girar.pack(fill="x", pady=(4, 4))
+        for coluna, (rotulo, codigo, descricao) in enumerate(self.GIROS):
+            botao = self._botao(linha_girar, rotulo,
+                                lambda c=codigo, d=descricao: self.girar(c, d),
+                                self.COR_SECUNDARIA, "white", padx=0)
+            botao.config(font=("Arial", 10, "bold"))
+            botao.grid(row=0, column=coluna, sticky="ew", padx=(0 if coluna == 0 else 4, 0))
+            linha_girar.grid_columnconfigure(coluna, weight=1, uniform="girar")
+            self.botoes_girar.append(botao)
 
         self.status_ocr = tk.StringVar(value="Escolha uma imagem ou inicie a câmera.")
         tk.Label(barra, textvariable=self.status_ocr, bg=self.COR_BARRA, fg=self.COR_TEXTO,
@@ -905,6 +927,8 @@ class ImagePreprocessorApp:
         self.btn_camera.config(text="Fechar câmera" if camera_ativa else "Câmera ao vivo")
         self._aplicar_estado(self.btn_capturar, not ocupado and camera_ativa)
         self._aplicar_estado(self.btn_ajustar, not ocupado and tem_imagem)
+        for botao in self.botoes_girar:
+            self._aplicar_estado(botao, not ocupado and tem_imagem)
         self._aplicar_estado(self.btn_processar, not ocupado and tem_imagem)
         self._aplicar_estado(self.btn_salvar, not ocupado and self.warped is not None)
         self._aplicar_estado(self.btn_salvar_pb, not ocupado and self.scan_pb is not None)
@@ -1104,6 +1128,21 @@ class ImagePreprocessorApp:
         self._limpar_resultados()
         self.mostrar("original", imagem)
         self.status_ocr.set("Imagem carregada. Clique em Processar.")
+        self._definir_estado_botoes()
+
+    def girar(self, codigo, descricao):
+        """Gira a imagem de entrada (ex.: foto de cabeça para baixo).
+
+        O giro é feito na imagem original, antes da detecção, e é sem perdas
+        (múltiplos de 90°). Os resultados anteriores deixam de valer, então são
+        limpos; clique em Processar para analisar a imagem na nova orientação.
+        """
+        if self.imagem is None or self.processando or self.camera is not None:
+            return
+        self.imagem = cv2.rotate(self.imagem, codigo)
+        self._limpar_resultados()
+        self.mostrar("original", self.imagem)
+        self.status_ocr.set(f"Imagem girada {descricao}. Clique em Processar.")
         self._definir_estado_botoes()
 
     def processar(self):
