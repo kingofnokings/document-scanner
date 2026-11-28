@@ -21,6 +21,8 @@ import cv2
 import numpy as np
 import pytesseract
 
+from nucleo.localizar_tesseract import configurar, instrucoes_de_instalacao
+
 # Confiança mínima (0 a 100) para uma palavra contar como "confiável".
 CONFIANCA_MINIMA = 40
 
@@ -49,14 +51,17 @@ os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 @lru_cache(maxsize=None)
 def _idiomas_instalados():
-    """Idiomas que o Tesseract tem instalados (consultado uma vez e guardado em cache)."""
+    """Idiomas que o Tesseract tem instalados (consultado uma vez e guardado em cache).
+
+    É a primeira vez que o Tesseract é usado, então é aqui que ele é localizado
+    (ver localizar_tesseract.py): o usuário não precisa configurar o PATH nem
+    instalar o idioma português, que já vem na pasta `tessdata/` do projeto.
+    """
+    configurar()
     try:
         return frozenset(pytesseract.get_languages(config=""))
     except pytesseract.TesseractNotFoundError as erro:
-        raise RuntimeError(
-            "O Tesseract não foi encontrado. Instale-o e confira se o comando "
-            "'tesseract' funciona no terminal (veja o README)."
-        ) from erro
+        raise RuntimeError(instrucoes_de_instalacao()) from erro
 
 
 def _escolher_idioma(idioma):

@@ -1,0 +1,9 @@
+# Finais de linha: o .bat precisa de CRLF e o .sh de LF, em qualquer sistema.
+*.bat text eol=crlf
+*.sh  text eol=lf
+*.py  text eol=lf
+# Arquivos binários (não converter nem comparar como texto).
+*.traineddata binary
+*.png binary
+*.jpg binary
+*.jpeg binary

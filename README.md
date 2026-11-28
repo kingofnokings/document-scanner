@@ -4,6 +4,37 @@ Projeto acadêmico desenvolvido para a disciplina de **Algoritmos de Processamen
 
 A aplicação utiliza Python, OpenCV e Tkinter para carregar imagens e visualizar diferentes etapas de pré-processamento em uma interface gráfica.
 
+## ⚡ Execução rápida (sem configurar nada)
+
+Você **não precisa** instalar o Tesseract à mão nem configurar variáveis de ambiente (`PATH`): o programa encontra o Tesseract sozinho e já traz os idiomas português e inglês na pasta `tessdata/`.
+
+### Windows: dois cliques no código-fonte
+
+1. Tenha o Python 3 instalado (https://www.python.org/downloads/, marcando **Add python.exe to PATH**).
+2. Dê dois cliques em `executar.bat`.
+
+Na primeira vez ele cria o ambiente virtual, instala as bibliotecas, instala o Tesseract com o `winget` (o Windows pede permissão de administrador) e abre o programa. Nas próximas vezes, apenas abre.
+
+### Linux (Ubuntu, Xubuntu, Debian, Fedora, Arch)
+
+```bash
+git clone <URL_DO_REPOSITORIO>
+cd <PASTA_DO_PROJETO>
+bash executar.sh
+```
+
+Na primeira vez o script cria o ambiente virtual, instala as bibliotecas, instala o Tesseract (pede a senha do `sudo`) e abre o programa. O `executar.sh` também serve no macOS com Homebrew (não testado).
+
+Requisitos: Python 3 e internet na primeira execução. O script instala o `python3-tk` e o `python3-venv` se faltarem.
+
+### Se algo der errado
+
+```bash
+python main.py --verificar
+```
+
+Informa se o Tesseract e os idiomas foram encontrados e, se não, como instalá-lo.
+
 ## ✨ Funcionalidades
 
 - 🖼️ **Carregamento de imagens:** seleção de arquivos diretamente pelo computador.
@@ -42,9 +73,9 @@ A aplicação utiliza Python, OpenCV e Tkinter para carregar imagens e visualiza
 | [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) | Motor de reconhecimento óptico de caracteres |
 | [pytesseract](https://github.com/madmaze/pytesseract)       | Integração do Tesseract com Python           |
 
-## 🚀 Instalação
+## 🔧 Instalação manual (opcional)
 
-Escolha abaixo as instruções correspondentes ao seu sistema operacional. Os comandos devem ser executados no terminal, dentro da pasta do projeto quando indicado.
+Os scripts `executar.bat` e `executar.sh` fazem tudo isto automaticamente. Use esta seção só se preferir instalar passo a passo. Escolha abaixo as instruções do seu sistema operacional; os comandos devem ser executados no terminal, dentro da pasta do projeto quando indicado.
 
 ### 🐧 Xubuntu / Linux (Debian e Ubuntu)
 
@@ -124,16 +155,13 @@ Uma pequena janela de demonstração deve aparecer. Se isso não acontecer, conf
 
 O Tesseract é um programa separado e não é instalado pelo `requirements.txt`. Uma opção comum para Windows é o instalador disponibilizado pela [UB Mannheim](https://github.com/UB-Mannheim/tesseract/wiki).
 
-Durante a instalação, inclua os dados de idioma para português (`por`) e inglês (`eng`), quando disponíveis. Se necessário, adicione a pasta de instalação do Tesseract à variável de ambiente `PATH` do Windows para que o comando `tesseract` seja reconhecido no terminal.
+**Não é preciso** configurar o `PATH` nem instalar o idioma português: o programa procura o Tesseract nas pastas de instalação do Windows (por exemplo, `C:\Program Files\Tesseract-OCR`) e usa os idiomas `por` e `eng` que já vêm na pasta `tessdata/` do projeto.
 
 Verifique a instalação:
 
 ```powershell
-tesseract --version
-tesseract --list-langs
+python main.py --verificar
 ```
-
-Na lista de idiomas, confira se aparecem `por` e `eng`.
 
 #### 3. Clone o repositório e entre na pasta
 
@@ -249,7 +277,7 @@ Pillow
 pytesseract
 ```
 
-Essas bibliotecas são instaladas dentro do ambiente virtual. **Tkinter e o programa Tesseract OCR não são instalados pelo `requirements.txt`**: o Tkinter é fornecido junto ao Python em muitas distribuições (no Xubuntu, instale o pacote `python3-tk` se necessário), enquanto o Tesseract deve ser instalado separadamente no sistema operacional.
+Essas bibliotecas são instaladas dentro do ambiente virtual. **Tkinter e o programa Tesseract OCR não são instalados pelo `requirements.txt`**: o Tkinter é fornecido junto ao Python em muitas distribuições (no Xubuntu, instale o pacote `python3-tk` se necessário), enquanto o Tesseract deve ser instalado separadamente no sistema operacional. Os idiomas do OCR (`por` e `eng`) já vêm no projeto, na pasta `tessdata/`.
 
 ## ✅ Verificação da instalação
 
@@ -259,11 +287,10 @@ Com o ambiente virtual ativado, verifique as dependências Python:
 python -m pip check
 ```
 
-Para verificar o Tesseract e os idiomas disponíveis:
+Para verificar o Tesseract e os idiomas disponíveis (o programa os procura sozinho, sem precisar do `PATH`):
 
 ```bash
-tesseract --version
-tesseract --list-langs
+python main.py --verificar
 ```
 
 Para confirmar que o Tkinter funciona:
@@ -278,13 +305,18 @@ No Windows, se o comando `python` não estiver disponível, tente `py -m tkinter
 
 ```text
 scanner-documentos/
-├── main.py                       # ponto de entrada: só cria a janela
+├── main.py                       # ponto de entrada (python main.py [--verificar])
+├── executar.bat                  # Windows: dois cliques instalam o que faltar e abrem o programa
+├── executar.sh                   # Linux/macOS: bash executar.sh faz o mesmo
+├── tessdata/                     # idiomas do OCR embutidos (por, eng)
 ├── nucleo/                       # processamento: NÃO depende de interface gráfica
 │   ├── configuracao.py           # constantes ajustáveis (cada uma comentada)
 │   ├── geometria.py              # ordenar cantos, perspectiva, retas e interseções
 │   ├── imagem.py                 # pré-processamento, efeito scanner, contorno
-│   ├── analise_rapida.py         # as etapas em versão leve (prévia da câmera)
 │   ├── ocr.py                    # leitura do texto com o Tesseract
+│   ├── localizar_tesseract.py    # acha o Tesseract e os idiomas sem configurar o PATH
+│   ├── verificar_ambiente.py     # confere o Tesseract (python main.py --verificar)
+│   ├── pdf.py                    # exportação em PDF pesquisável
 │   └── deteccao/
 │       ├── pipeline.py           # detectar_documento(): orquestra as 3 passadas
 │       ├── candidatos.py         # passadas 1 e 2 (Otsu, Canny, Hough, CLAHE)
@@ -302,6 +334,7 @@ scanner-documentos/
 │   ├── camera.py                 # câmera ao vivo
 │   ├── processamento.py          # thread + fila
 │   └── dialogo_cantos.py         # "Ajustar cantos"
+├── ferramentas/empacotar.py      # gera o executável (PyInstaller)
 ├── assets/                       # imagens de teste
 ├── requirements.txt
 ├── README.md

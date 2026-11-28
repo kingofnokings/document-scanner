@@ -10,5 +10,10 @@ Organização:
     deteccao/     como a folha é encontrada na foto (3 passadas)
     imagem        pré-processamento, efeito de scanner e desenho do contorno
     ocr           leitura do texto com o Tesseract
+<<<<<<< HEAD
+=======
+    localizar_tesseract  acha o Tesseract e os idiomas sem configurar o PATH
+    verificar_ambiente   confere o Tesseract (python main.py --verificar)
+>>>>>>> 5c5af01 (Gerar executavel do sistema)
     pdf           exportação em PDF pesquisável (imagem + camada de texto)
 """
